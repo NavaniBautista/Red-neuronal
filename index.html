@@ -1,0 +1,2524 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Red neuronal · 4K</title>
+<style>
+html,body{margin:0;padding:0;width:100%;height:100%;background:#000;overflow:hidden}
+canvas{display:block;position:fixed;left:0;top:0;touch-action:none;cursor:pointer}
+</style>
+</head>
+<body>
+<canvas id="screen"></canvas>
+<script>
+'use strict';
+/* =====================================================================
+   NEURAL NET — a real 784-16-16-10 MLP learning procedural digits, drawn as
+   vector graphics at the display's native resolution (4K on a 4K screen).
+   Vanilla JS + Canvas 2D + WebAudio only.
+   Simulation (dataset, network, state machine, particles) is independent
+   of rendering: everything runs headless via selfTest() or ?test.
+   ===================================================================== */
+
+// ---------------------------------------------------------------- constants
+const LW = 256, LH = 144;
+const DT = 1000 / 60;
+const N0 = 784, N1 = 16, N2 = 16, N3 = 10;
+const NTRAIN = 3000, NTEST = 500, NVAL = 500;   // train / test / validation (three-way holdout)
+const BATCH = 32, LR = 0.0004, MOM = 0.9;   // η deliberately low so ≥93% takes ~70 s of animation (with the usual
+                                            // η ≈ 0.01 this net gets there in ~150 steps, under one cycle)
+const DATA_SEED = 0x5eed1e55, NET_SEED0 = 7;
+const ST_IDLE = 0, ST_INPUT = 1, ST_FORWARD = 2, ST_SOFTMAX = 3, ST_LOSS = 4,
+      ST_BACKWARD = 5, ST_UPDATE = 6, ST_TRAIN = 7, ST_SOLVED = 8;
+const DUR = [25, 25, 110, 30, 35, 110, 45, 65, 240];
+const CYCLE_FRAMES = 445;
+const TRAIN_STEPS_PER_FRAME = 3;
+const TRAVEL = 18;            // frames a forward pulse needs to cross one layer gap
+const TRAVEL_B = 15;          // backward pulses are faster
+const TL_LOSS = 10;           // true-label bar → loss node (LOSS) and loss node → each output (BACKWARD)
+const BT0 = 13, BSP = 23;     // backward layer windows start at BT0 + (2 − L)·BSP, plus a 0..7 frame stagger
+const TW = 8, PAINT_D = 18;   // input neuron → pixel wire pulses; sweep that paints ∂L/∂x on the image
+const K_TOP = 5;              // drawn incoming edges per destination neuron
+const NWL = 6;                // line-width levels of the dormant mesh (thickness ∝ |w|)
+const PCAP = 384;             // particle pool capacity
+const MAX_STEPS = 8000;
+const PI = Math.PI;
+// events the simulation emits for the (optional) audio layer; ring buffer of 256
+const EV_STATE = 1, EV_WRITE = 2, EV_LAUNCH = 3, EV_ARRIVE = 4, EV_IGNF = 5, EV_IGNB = 6, EV_PRED = 7, EV_GLITCH = 8,
+      EV_LOSS = 9, EV_UPDATE = 10, EV_TICK = 11, EV_EVAL = 12, EV_SCAN = 13, EV_PARADE = 14, EV_RESET = 15,
+      EV_PAINT = 16, EV_WIRE = 17;
+
+const nowMs = (typeof performance !== 'undefined' && performance.now)
+  ? function () { return performance.now(); } : function () { return Date.now(); };
+
+// ---------------------------------------------------------------- palette (25 colors)
+const PAL_HEX = [
+  '#000000', // 0  black
+  '#080c18', // 1  dot texture (darkest navy)
+  '#101831', // 2  dormant connection
+  '#22325f', // 3  neuron ring
+  '#0c1f5c', // 4  F0 deep navy
+  '#1440b8', // 5  F1 royal blue
+  '#2a6cff', // 6  F2 electric blue
+  '#45b4ff', // 7  F3 bright cyan-blue
+  '#b4ecff', // 8  F4 pale cyan
+  '#ffffff', // 9  white
+  '#3a0b22', // 10 B0 dark wine
+  '#8c0f3c', // 11 B1 crimson
+  '#e01a5e', // 12 B2 hot red-magenta
+  '#ff40b4', // 13 B3 bright magenta
+  '#ffb8e0', // 14 B4 pale pink
+  '#333333', // 15 G1
+  '#6e6e6e', // 16 G2
+  '#b0b0b0', // 17 G3
+  '#9aa4b8', // 18 label gray
+  '#6a7388', // 19 frame gray
+  '#454d61', // 20 HUD gray
+  '#0a1538', // 21 dot wave (blue)
+  '#1e0818', // 22 dot wave (magenta)
+  '#18264e', // 23 strong dormant connection / bar track
+  '#2c3f78'  // 24 ring (breathing)
+];
+const FR = new Uint8Array([4, 5, 6, 7, 8, 9]);        // forward ramp
+const BR = new Uint8Array([10, 11, 12, 13, 14, 9]);   // backward ramp
+const BRK = new Uint8Array([9, 14, 13, 12, 11]);      // loss flash white -> magenta
+
+// ---------------------------------------------------------------- PRNG (mulberry32)
+function Rng(seed) { this.s = seed >>> 0; }
+Rng.prototype.next = function () {
+  let t = (this.s = (this.s + 0x6D2B79F5) >>> 0);
+  t = Math.imul(t ^ (t >>> 15), t | 1);
+  t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+};
+Rng.prototype.range = function (a, b) { return a + (b - a) * this.next(); };
+Rng.prototype.int = function (n) { return (this.next() * n) | 0; };
+Rng.prototype.gauss = function () {
+  let u = 0; while (u <= 1e-12) u = this.next();
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * PI * this.next());
+};
+
+// ---------------------------------------------------------------- procedural digits
+function arc(cx, cy, rx, ry, a0, a1, n) {
+  const p = [];
+  for (let i = 0; i <= n; i++) { const t = a0 + (a1 - a0) * i / n; p.push(cx + rx * Math.cos(t), cy + ry * Math.sin(t)); }
+  return p;
+}
+function cat() { let r = []; for (let i = 0; i < arguments.length; i++) r = r.concat(arguments[i]); return r; }
+// Each digit: list of variants; variant: list of strokes; stroke: flat [x,y,...] in a unit box.
+const GLYPHS = [
+  [[arc(.5, .5, .26, .4, -PI / 2, 1.5 * PI + .2, 30)], [arc(.5, .5, .3, .38, -PI * .65, 1.35 * PI + .25, 30)]],
+  [[[.52, .1, .48, .9]], [[.33, .27, .53, .1, .5, .9]], [[.33, .27, .53, .1, .5, .9], [.34, .9, .68, .9]]],
+  [[cat(arc(.5, .32, .25, .22, -PI * .95, PI * .22, 16), [.24, .9, .8, .9])],
+   [cat(arc(.5, .3, .26, .2, -PI, PI * .2, 16), [.22, .88]), [.22, .88, .82, .86]]],
+  [[cat(arc(.48, .3, .23, .2, -PI * .85, PI * .5, 14), arc(.48, .69, .27, .21, -PI * .5, PI * .85, 14))],
+   [cat([.25, .1, .75, .1, .45, .44], arc(.48, .67, .27, .23, -PI * .6, PI * .85, 14))]],
+  [[[.64, .92, .64, .1, .18, .64, .84, .64]], [[.3, .1, .24, .6, .82, .6], [.66, .3, .66, .92]]],
+  [[cat([.76, .1, .33, .1, .29, .46], arc(.47, .66, .27, .24, -PI * .75, PI * .8, 16))],
+   [cat([.33, .1, .29, .46], arc(.47, .66, .27, .24, -PI * .75, PI * .8, 16)), [.33, .1, .76, .1]]],
+  [[cat([.7, .1, .48, .22, .33, .42], arc(.5, .68, .21, .22, PI + .4, 3 * PI + .4, 24))],
+   [cat([.66, .08, .4, .3], arc(.5, .66, .23, .24, PI + .6, 3 * PI + .5, 24))]],
+  [[[.2, .1, .8, .1, .42, .9]], [[.2, .1, .8, .1, .42, .9], [.33, .5, .72, .5]], [[.2, .22, .2, .1, .8, .1, .42, .9]]],
+  [[arc(.5, .29, .2, .19, -PI / 2, 1.5 * PI, 22), arc(.5, .69, .25, .21, -PI / 2, 1.5 * PI, 24)],
+   [cat(arc(.5, .3, .21, .2, PI / 2, -1.5 * PI, 22), arc(.5, .7, .24, .2, -PI / 2, 1.5 * PI, 24))]],
+  [[arc(.5, .32, .23, .21, 0, 2 * PI + .15, 24), [.73, .32, .66, .9]],
+   [cat(arc(.5, .3, .22, .2, PI * .1, 2 * PI + .1, 24), [.72, .36, .7, .62, .6, .9])]]
+];
+
+const CV = 40;                                   // oversized raster, cropped by center of mass
+const TMPV = new Float32Array(CV * CV), TMPO = new Uint8Array(CV * CV);
+const SPX = new Float32Array(1024), SPY = new Float32Array(1024), SSTART = new Int32Array(8);
+const SLEN = new Float32Array(8), STRIM0 = new Float32Array(8), STRIM1 = new Float32Array(8);
+const WARP = 0.07, TRIM = 0.14, GLYPH_PX = 23;   // elastic wobble amplitude, max fraction of a stroke left undrawn
+
+function stamp(cx, cy, r, ord) {
+  const x0 = Math.max(0, Math.floor(cx - r - 1)), x1 = Math.min(CV - 1, Math.ceil(cx + r + 1));
+  const y0 = Math.max(0, Math.floor(cy - r - 1)), y1 = Math.min(CV - 1, Math.ceil(cy + r + 1));
+  for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+    const dx = x + 0.5 - cx, dy = y + 0.5 - cy;
+    let v = r + 0.5 - Math.sqrt(dx * dx + dy * dy);
+    if (v <= 0) continue; if (v > 1) v = 1;
+    const i = y * CV + x;
+    if (v > TMPV[i]) TMPV[i] = v;
+    if (v > 0.1 && TMPO[i] === 255) TMPO[i] = ord;
+  }
+}
+
+// X: pixel values 0..1, O: stroke order 0..254 (255 = faint / never) used for the "writing" reveal.
+function genSample(rng, d, X, O, base) {
+  const vars = GLYPHS[d], strokes = vars[rng.int(vars.length)];
+  const rot = rng.range(-12, 12) * PI / 180, sc = rng.range(0.8, 1.1), sh = rng.range(-0.3, 0.3);
+  const asp = rng.range(0.85, 1.15), tx = rng.range(-2, 2), ty = rng.range(-2, 2);
+  const r = rng.range(1.5, 3) / 2;
+  const w1 = rng.range(-WARP, WARP), f1 = rng.range(0.5, 1.5) * 2 * PI, p1 = rng.range(0, 2 * PI);
+  const w2 = rng.range(-WARP, WARP), f2 = rng.range(0.5, 1.5) * 2 * PI, p2 = rng.range(0, 2 * PI);
+  const cs = Math.cos(rot), sn = Math.sin(rot);
+  TMPV.fill(0); TMPO.fill(255);
+  let np = 0, total = 0;
+  for (let si = 0; si < strokes.length; si++) {
+    const s = strokes[si], n = s.length >> 1, ctrl = n <= 8;
+    const ox = rng.range(-0.02, 0.02), oy = rng.range(-0.02, 0.02);
+    SSTART[si] = np; SLEN[si] = 0;
+    STRIM0[si] = rng.range(0, TRIM); STRIM1[si] = 1 - rng.range(0, TRIM);   // pen lifts early / starts late
+    for (let k = 0; k < n; k++) {
+      let u = s[2 * k] + ox, v = s[2 * k + 1] + oy;
+      if (ctrl) { u += rng.range(-0.03, 0.03); v += rng.range(-0.03, 0.03); }   // control-point jitter
+      const uu = u + w1 * Math.sin(f1 * v + p1), vv = v + w2 * Math.sin(f2 * u + p2);
+      let x = (uu - 0.5) * GLYPH_PX * asp; const y = (vv - 0.5) * GLYPH_PX;
+      x -= sh * y;                                                              // slant
+      SPX[np] = 20 + sc * (x * cs - y * sn) + tx;
+      SPY[np] = 20 + sc * (x * sn + y * cs) + ty;
+      if (k > 0) { const l = Math.hypot(SPX[np] - SPX[np - 1], SPY[np] - SPY[np - 1]); total += l; SLEN[si] += l; }
+      np++;
+    }
+  }
+  SSTART[strokes.length] = np;
+  let acc = 0;
+  for (let si = 0; si < strokes.length; si++) {
+    let sacc = 0;
+    const lo = STRIM0[si] * SLEN[si], hi = STRIM1[si] * SLEN[si];
+    for (let k = SSTART[si]; k < SSTART[si + 1] - 1; k++) {
+      const x0 = SPX[k], y0 = SPY[k], x1 = SPX[k + 1], y1 = SPY[k + 1];
+      const L = Math.hypot(x1 - x0, y1 - y0), n = Math.max(1, Math.ceil(L / 0.3));
+      for (let q = 0; q <= n; q++) {
+        const f = q / n, sp = sacc + L * f;
+        if (sp < lo || sp > hi) continue;
+        stamp(x0 + (x1 - x0) * f, y0 + (y1 - y0) * f, r, Math.min(254, ((acc + L * f) / total * 254) | 0));
+      }
+      acc += L; sacc += L;
+    }
+  }
+  // center of mass -> (14,14), like MNIST
+  let sw = 0, sx = 0, sy = 0;
+  for (let y = 0; y < CV; y++) for (let x = 0; x < CV; x++) {
+    const v = TMPV[y * CV + x]; sw += v; sx += (x + 0.5) * v; sy += (y + 0.5) * v;
+  }
+  const c0 = Math.round(sx / sw - 14), r0 = Math.round(sy / sw - 14);
+  for (let rr = 0; rr < 28; rr++) for (let cc = 0; cc < 28; cc++) {
+    const xs = cc + c0, ys = rr + r0, idx = base + rr * 28 + cc;
+    if (xs >= 0 && xs < CV && ys >= 0 && ys < CV) { X[idx] = TMPV[ys * CV + xs]; O[idx] = TMPO[ys * CV + xs]; }
+    else { X[idx] = 0; O[idx] = 255; }
+  }
+}
+
+const trainX = new Float32Array(NTRAIN * N0), trainY = new Uint8Array(NTRAIN), trainO = new Uint8Array(NTRAIN * N0);
+const testX = new Float32Array(NTEST * N0), testY = new Uint8Array(NTEST), testO = new Uint8Array(NTEST * N0);
+// validation digits: never trained on; they decide when the run counts as SOLVED, so the test set stays untouched
+// until the final model is evaluated once (generated after the test set, so train/test are unchanged)
+const valX = new Float32Array(NVAL * N0), valY = new Uint8Array(NVAL), valO = new Uint8Array(NVAL * N0);
+(function buildDataset() {
+  const rng = new Rng(DATA_SEED);
+  for (let i = 0; i < NTRAIN; i++) { const d = i % 10; trainY[i] = d; genSample(rng, d, trainX, trainO, i * N0); }
+  for (let i = 0; i < NTEST; i++) { const d = i % 10; testY[i] = d; genSample(rng, d, testX, testO, i * N0); }
+  for (let i = 0; i < NVAL; i++) { const d = i % 10; valY[i] = d; genSample(rng, d, valX, valO, i * N0); }
+})();
+
+// ---------------------------------------------------------------- network 784-16-16-10
+// Weight layout is input-major: W[i*Nout + j] connects input i -> output j.
+function Net() {
+  this.W1 = new Float32Array(N0 * N1); this.b1 = new Float32Array(N1);
+  this.W2 = new Float32Array(N1 * N2); this.b2 = new Float32Array(N2);
+  this.W3 = new Float32Array(N2 * N3); this.b3 = new Float32Array(N3);
+  this.vW1 = new Float32Array(N0 * N1); this.vb1 = new Float32Array(N1);
+  this.vW2 = new Float32Array(N1 * N2); this.vb2 = new Float32Array(N2);
+  this.vW3 = new Float32Array(N2 * N3); this.vb3 = new Float32Array(N3);
+  this.gW1 = new Float32Array(N0 * N1); this.gb1 = new Float32Array(N1);
+  this.gW2 = new Float32Array(N1 * N2); this.gb2 = new Float32Array(N2);
+  this.gW3 = new Float32Array(N2 * N3); this.gb3 = new Float32Array(N3);
+  this.z1 = new Float32Array(N1); this.a1 = new Float32Array(N1);
+  this.z2 = new Float32Array(N2); this.a2 = new Float32Array(N2);
+  this.z3 = new Float32Array(N3); this.p = new Float32Array(N3); this.lse = 0;   // lse = log Σ_k exp z_k
+  this.d1 = new Float32Array(N1); this.d2 = new Float32Array(N2); this.d3 = new Float32Array(N3);
+  this.perm = new Int32Array(NTRAIN);
+  this.rng = new Rng(1);
+  this.ptr = 0; this.epoch = 1; this.steps = 0; this.trainLoss = Math.log(10); this.emaRaw = 0; this.emaN = 0;
+  this.lastAcc = 0; this.lastLoss = Math.log(10);   // result of the last evaluate() (validation or test set)
+}
+Net.prototype.reset = function (seed) {
+  const r = this.rng; r.s = seed >>> 0;
+  let sd = Math.sqrt(2 / N0); for (let i = 0; i < this.W1.length; i++) this.W1[i] = r.gauss() * sd;
+  sd = Math.sqrt(2 / N1); for (let i = 0; i < this.W2.length; i++) this.W2[i] = r.gauss() * sd;
+  sd = Math.sqrt(2 / N2); for (let i = 0; i < this.W3.length; i++) this.W3[i] = r.gauss() * sd;
+  this.b1.fill(0); this.b2.fill(0); this.b3.fill(0);
+  this.vW1.fill(0); this.vb1.fill(0); this.vW2.fill(0); this.vb2.fill(0); this.vW3.fill(0); this.vb3.fill(0);
+  for (let i = 0; i < NTRAIN; i++) this.perm[i] = i;
+  this.shuffle(); this.ptr = 0; this.epoch = 1; this.steps = 0; this.emaRaw = 0; this.emaN = 0;
+  let l0 = 0;   // before the first step the shown training loss is that of the initial weights on the first mini-batch
+  for (let b = 0; b < BATCH; b++) { const s = this.perm[b]; this.forward(trainX, s * N0); l0 += this.nll(trainY[s]); }
+  this.trainLoss = l0 / BATCH;
+};
+Net.prototype.shuffle = function () {
+  const p = this.perm;
+  for (let i = p.length - 1; i > 0; i--) { const j = this.rng.int(i + 1); const t = p[i]; p[i] = p[j]; p[j] = t; }
+};
+Net.prototype.ensureBatch = function () {
+  if (this.ptr + BATCH > NTRAIN) { this.shuffle(); this.ptr = 0; this.epoch++; }
+};
+Net.prototype.forward = function (X, off) {
+  const W1 = this.W1, W2 = this.W2, W3 = this.W3, z1 = this.z1, a1 = this.a1, z2 = this.z2, a2 = this.a2, z3 = this.z3, p = this.p;
+  for (let j = 0; j < N1; j++) z1[j] = this.b1[j];
+  for (let i = 0; i < N0; i++) {
+    const x = X[off + i]; if (x === 0) continue;
+    const r = i * N1; for (let j = 0; j < N1; j++) z1[j] += W1[r + j] * x;
+  }
+  for (let j = 0; j < N1; j++) a1[j] = z1[j] > 0 ? z1[j] : 0;
+  for (let j = 0; j < N2; j++) z2[j] = this.b2[j];
+  for (let i = 0; i < N1; i++) { const a = a1[i]; if (a === 0) continue; const r = i * N2; for (let j = 0; j < N2; j++) z2[j] += W2[r + j] * a; }
+  for (let j = 0; j < N2; j++) a2[j] = z2[j] > 0 ? z2[j] : 0;
+  for (let k = 0; k < N3; k++) z3[k] = this.b3[k];
+  for (let i = 0; i < N2; i++) { const a = a2[i]; if (a === 0) continue; const r = i * N3; for (let k = 0; k < N3; k++) z3[k] += W3[r + k] * a; }
+  let m = z3[0]; for (let k = 1; k < N3; k++) if (z3[k] > m) m = z3[k];
+  let s = 0; for (let k = 0; k < N3; k++) { const e = Math.exp(z3[k] - m); p[k] = e; s += e; }
+  const inv = 1 / s; for (let k = 0; k < N3; k++) p[k] *= inv;
+  this.lse = m + Math.log(s);   // shifted log-sum-exp: no overflow, and s ≥ 1 so no log(0)
+};
+// cross-entropy of the last forward pass in the log domain: −ln p_y = logsumexp(z) − z_y (what LogSoftmax + NLLLoss
+// compute). Exact even when p_y underflows to 0 in float32, where −ln max(p_y, ε) would silently cap the loss.
+Net.prototype.nll = function (y) { return this.lse - this.z3[y]; };
+// deltas for the sample last passed through forward(): dL/dz at every layer
+Net.prototype.deltas = function (y) {
+  const d1 = this.d1, d2 = this.d2, d3 = this.d3, W2 = this.W2, W3 = this.W3;
+  for (let k = 0; k < N3; k++) d3[k] = this.p[k] - (k === y ? 1 : 0);
+  for (let i = 0; i < N2; i++) {
+    if (this.z2[i] > 0) { let s = 0; const r = i * N3; for (let k = 0; k < N3; k++) s += W3[r + k] * d3[k]; d2[i] = s; } else d2[i] = 0;
+  }
+  for (let i = 0; i < N1; i++) {
+    if (this.z1[i] > 0) { let s = 0; const r = i * N2; for (let j = 0; j < N2; j++) s += W2[r + j] * d2[j]; d1[i] = s; } else d1[i] = 0;
+  }
+};
+Net.prototype.accumulate = function (X, off) {
+  const d1 = this.d1, d2 = this.d2, d3 = this.d3, a1 = this.a1, a2 = this.a2;
+  for (let k = 0; k < N3; k++) this.gb3[k] += d3[k];
+  for (let i = 0; i < N2; i++) { const a = a2[i]; if (a === 0) continue; const r = i * N3; for (let k = 0; k < N3; k++) this.gW3[r + k] += a * d3[k]; }
+  for (let j = 0; j < N2; j++) this.gb2[j] += d2[j];
+  for (let i = 0; i < N1; i++) { const a = a1[i]; if (a === 0) continue; const r = i * N2; for (let j = 0; j < N2; j++) this.gW2[r + j] += a * d2[j]; }
+  for (let j = 0; j < N1; j++) this.gb1[j] += d1[j];
+  const g = this.gW1;
+  for (let i = 0; i < N0; i++) { const x = X[off + i]; if (x === 0) continue; const r = i * N1; for (let j = 0; j < N1; j++) g[r + j] += x * d1[j]; }
+};
+Net.prototype.zeroGrads = function () {
+  this.gW1.fill(0); this.gb1.fill(0); this.gW2.fill(0); this.gb2.fill(0); this.gW3.fill(0); this.gb3.fill(0);
+};
+function sgd(w, v, g, s) {
+  for (let i = 0; i < w.length; i++) { const vi = MOM * v[i] - LR * g[i] * s; v[i] = vi; w[i] += vi; }
+}
+Net.prototype.trainStep = function () {
+  this.ensureBatch(); this.zeroGrads();
+  let loss = 0;
+  for (let b = 0; b < BATCH; b++) {
+    const s = this.perm[this.ptr + b], off = s * N0, y = trainY[s];
+    this.forward(trainX, off);
+    loss += this.nll(y);
+    this.deltas(y); this.accumulate(trainX, off);
+  }
+  const sc = 1 / BATCH;
+  sgd(this.W1, this.vW1, this.gW1, sc); sgd(this.b1, this.vb1, this.gb1, sc);
+  sgd(this.W2, this.vW2, this.gW2, sc); sgd(this.b2, this.vb2, this.gb2, sc);
+  sgd(this.W3, this.vW3, this.gW3, sc); sgd(this.b3, this.vb3, this.gb3, sc);
+  this.ptr += BATCH; this.steps++;
+  loss /= BATCH;
+  // shown training loss: exponential moving average (β = 0.9) with the zero-start bias removed (as in Adam, §3)
+  this.emaRaw = 0.9 * this.emaRaw + 0.1 * loss; this.emaN++;
+  this.trainLoss = this.emaRaw / (1 - Math.pow(0.9, this.emaN));
+  return loss;
+};
+Net.prototype.argmax = function () { let b = 0; for (let k = 1; k < N3; k++) if (this.p[k] > this.p[b]) b = k; return b; };
+Net.prototype.evaluate = function (X, Y, n, conf) {
+  let ok = 0, loss = 0;
+  for (let s = 0; s < n; s++) {
+    this.forward(X, s * N0);
+    const am = this.argmax(), y = Y[s];
+    if (am === y) ok++;
+    if (conf) conf[y * 10 + am]++;
+    loss += this.nll(y);
+  }
+  this.lastAcc = ok / n; this.lastLoss = loss / n;
+  return this.lastAcc;
+};
+
+// ---------------------------------------------------------------- layout
+const LX = [52, 92, 132, 172];
+const LN = [16, 16, 16, 10];
+const LOFF = [0, 16, 32, 48];
+const NNEU = 58;
+const NX = new Int16Array(NNEU), NY = new Int16Array(NNEU);
+for (let i = 0; i < 16; i++) { NX[i] = LX[0]; NY[i] = i < 8 ? 10 + i * 7 : 73 + (i - 8) * 7; }
+for (let i = 0; i < 16; i++) { NX[16 + i] = LX[1]; NY[16 + i] = 13 + i * 7; NX[32 + i] = LX[2]; NY[32 + i] = 13 + i * 7; }
+for (let i = 0; i < 10; i++) { NX[48 + i] = LX[3]; NY[48 + i] = 16 + i * 11; }
+const SAMPLE_PIX = new Int16Array(16);
+// the 16 drawn input neurons read the 16 most variable pixels of the training set (central region, ≥3 px apart),
+// ordered top→bottom so the wires from the image to the input layer do not tangle
+(function choosePixels() {
+  const sum = new Float64Array(N0), sq = new Float64Array(N0);
+  for (let s = 0; s < NTRAIN; s++) for (let i = 0; i < N0; i++) { const v = trainX[s * N0 + i]; sum[i] += v; sq[i] += v * v; }
+  const vr = new Float64Array(N0);
+  for (let i = 0; i < N0; i++) { const m = sum[i] / NTRAIN; vr[i] = sq[i] / NTRAIN - m * m; }
+  const pick = [];
+  for (let gap = 4; pick.length < 16 && gap >= 1; gap--) {
+    while (pick.length < 16) {
+      let best = -1, bv = -1;
+      for (let i = 0; i < N0; i++) {
+        const r = (i / 28) | 0, c = i % 28;
+        if (r < 3 || r > 24 || c < 3 || c > 24) continue;
+        let ok = true;
+        for (let q = 0; q < pick.length; q++) { const j = pick[q]; if (Math.max(Math.abs(r - ((j / 28) | 0)), Math.abs(c - j % 28)) < gap) { ok = false; break; } }
+        if (ok && vr[i] > bv) { bv = vr[i]; best = i; }
+      }
+      if (best < 0) break;
+      pick.push(best);
+    }
+  }
+  pick.sort(function (a, b) { return a - b; });
+  for (let i = 0; i < 16; i++) SAMPLE_PIX[i] = pick[i];
+})();
+const PANEL_X = 4, PANEL_Y = 48, DIG_X = 10, DIG_Y = 54;
+const PRED_X = 225, PRED_Y = 22, PRED_W = 28, PRED_H = 30, LED_X = 234, LED_Y = 28;
+const LOSS_X = 221, LOSS_Y = 80, LOSS_R = 3.6;                 // loss node L = −ln p_y (diamond)
+const LOSS_ST = new Uint8Array([0, 2, 1, 0, 2, 1, 0, 2, 1, 0]);  // stagger of the loss → output pulses
+const SCAN_X0 = 46, SCAN_X1 = 225;
+const LOSS_TX = 217;   // the loss readout sits under the diamond, clear of the fan of lines
+const LABEL_X = LX[3] + 8, BAR_X = LX[3] + 13;
+const DOT_X0 = 58, DOT_X1 = 168, DOT_Y0 = 12, DOT_Y1 = 126;
+const DOTSKIP = new Uint8Array(LW);
+for (let x = LX[1] - 2; x <= LX[1] + 6; x++) DOTSKIP[x] = 1;
+for (let x = LX[2] - 2; x <= LX[2] + 6; x++) DOTSKIP[x] = 1;
+
+// ---------------------------------------------------------------- Bresenham paths (all drawable edges, once)
+const PBASE = [0, 256, 512], NPATH = 672, NE = 16 * K_TOP + 16 * K_TOP + 10 * K_TOP;
+const POFF = new Int32Array(NPATH), PLEN = new Int16Array(NPATH);
+let PPIX;
+(function buildPaths() {
+  let total = 0;
+  for (let pass = 0; pass < 2; pass++) {
+    let o = 0;
+    for (let L = 0; L < 3; L++) for (let s = 0; s < LN[L]; s++) for (let d = 0; d < LN[L + 1]; d++) {
+      let x0 = LX[L] + 5, y0 = NY[LOFF[L] + s] + 2; const x1 = LX[L + 1] - 1, y1 = NY[LOFF[L + 1] + d] + 2;
+      const id = PBASE[L] + s * LN[L + 1] + d;
+      const dx = Math.abs(x1 - x0), dy = -Math.abs(y1 - y0), sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+      if (pass === 0) { const n = Math.max(dx, -dy) + 1; PLEN[id] = n; POFF[id] = o; o += n; continue; }
+      let err = dx + dy, k = POFF[id];
+      for (;;) {
+        PPIX[k++] = y0 * LW + x0;
+        if (x0 === x1 && y0 === y1) break;
+        const e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+      }
+    }
+    if (pass === 0) { total = o; PPIX = new Uint16Array(total); }
+  }
+})();
+
+// ---------------------------------------------------------------- text, captions, geometry for the vector renderer
+const NAMES = ['IDLE', 'INPUT', 'FORWARD', 'SOFTMAX', 'LOSS', 'BACKWARD', 'UPDATE', 'TRAIN', 'SOLVED'];
+const CAPS = ['REPOSO', 'ENTRADA: UN DÍGITO DEL LOTE ACTUAL', 'PROPAGACIÓN HACIA ADELANTE', 'PROBABILIDADES DE CADA CLASE',
+  'PÉRDIDA: ENTROPÍA CRUZADA', 'RETROPROPAGACIÓN DEL ERROR', 'SGD + MOMENTO: AJUSTE DE PESOS', 'ENTRENAMIENTO RÁPIDO (SIN DIBUJAR)', '¡RESUELTO! VALIDACIÓN ≥ 95% 2 CICLOS'];
+const CAP_LIMIT = 'LÍMITE DE 8000 PASOS, SE REINICIA';
+const PHASE_NUM = ['1/8', '2/8', '3/8', '4/8', '5/8', '6/8', '7/8', '8/8', ''];
+const PHASE_COL = [18, 8, 7, 9, 14, 13, 6, 18, 9];
+const DIG = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'];
+const SPD_TXT = ['1×', '½×', '¼×'];
+const SEG_X = new Float32Array(8), SEG_W = new Float32Array(8);      // 8-segment phase strip, widths ∝ frame budgets
+(function () {
+  let acc = 0;
+  for (let s = 0; s < 8; s++) {
+    const x0 = 24 + acc / CYCLE_FRAMES * 208; acc += DUR[s];
+    SEG_X[s] = x0; SEG_W[s] = 24 + acc / CYCLE_FRAMES * 208 - x0 - 1;
+  }
+})();
+// straight-line geometry of every drawable connection (logical units): from ring edge to ring edge
+const NR = 2.1;
+const PX0 = new Float32Array(NPATH), PY0 = new Float32Array(NPATH), PX1 = new Float32Array(NPATH), PY1 = new Float32Array(NPATH);
+for (let L = 0; L < 3; L++) for (let s = 0; s < LN[L]; s++) for (let d = 0; d < LN[L + 1]; d++) {
+  const id = PBASE[L] + s * LN[L + 1] + d;
+  PX0[id] = LX[L] + 2.5 + NR; PY0[id] = NY[LOFF[L] + s] + 2.5;
+  PX1[id] = LX[L + 1] + 2.5 - NR; PY1[id] = NY[LOFF[L + 1] + d] + 2.5;
+}
+// 7-segment LED: hexagonal segments a..g in a 10×18 box; LEDO = reveal order per digit (255 = off)
+const LEDP = new Float32Array(7 * 12), LEDO = new Uint8Array(70);
+(function () {
+  const h = 1;
+  const H = function (s, x0, x1, y) { LEDP.set([x0, y, x0 + h, y - h, x1 - h, y - h, x1, y, x1 - h, y + h, x0 + h, y + h], s * 12); };
+  const V = function (s, x, y0, y1) { LEDP.set([x, y0, x + h, y0 + h, x + h, y1 - h, x, y1, x - h, y1 - h, x - h, y0 + h], s * 12); };
+  H(0, 1.3, 8.7, 1); V(1, 9, 1.3, 8.7); V(2, 9, 9.3, 16.7); H(3, 1.3, 8.7, 17); V(4, 1, 9.3, 16.7); V(5, 1, 1.3, 8.7); H(6, 1.3, 8.7, 9);
+  const DS = ['abcdef', 'bc', 'abged', 'abgcd', 'fgbc', 'afgcd', 'afgedc', 'abc', 'abcdefg', 'abcdfg'];
+  for (let d = 0; d < 10; d++) { let k = 0; for (let s = 0; s < 7; s++) LEDO[d * 7 + s] = DS[d].indexOf('abcdefg'[s]) >= 0 ? k++ : 255; }
+})();
+
+// ---------------------------------------------------------------- simulation (no canvas needed)
+function Sim(seed) {
+  this.net = new Net();
+  this.vr = new Rng(((seed * 2654435761) ^ 0x9e3779b9) >>> 0);   // visual-only randomness
+  this.state = ST_IDLE; this.t = 0; this.frame = 0;
+  this.budgetMs = 0; this.noSolve = false;
+  // drawn edges (top-k)
+  this.eL = new Uint8Array(NE); this.eS = new Uint8Array(NE); this.eD = new Uint8Array(NE);
+  this.eP = new Int16Array(NE); this.eWI = new Int32Array(NE); this.eRest = new Uint8Array(NE);
+  this.eAbs = new Float32Array(NE); this.eFI = new Float32Array(NE); this.eBI = new Float32Array(NE); this.eFl = new Float32Array(NE);
+  this.eFT = new Int16Array(NE); this.eBT = new Int16Array(NE);
+  this.eNeg = new Uint8Array(NE); this.eBNeg = new Uint8Array(NE); this.eUNeg = new Uint8Array(NE);   // sign of w, dW, Δw
+  this.eWL = new Uint8Array(NE);                                                                        // line-width level ∝ |w|
+  this.nFwdT = new Int16Array(NNEU); this.nBwdT = new Int16Array(NNEU);
+  this.fwdLv = new Uint8Array(NNEU); this.bwdLv = new Uint8Array(NNEU);
+  this.SCR = new Float32Array(16); this.USED = new Uint8Array(16); this.MX = new Float32Array(3); this.MX2 = new Float32Array(3);
+  // highlighted sample
+  this.vIn = new Float32Array(16); this.va1 = new Float32Array(N1); this.va2 = new Float32Array(N2); this.vp = new Float32Array(N3);
+  this.vd0 = new Float32Array(16); this.vd1 = new Float32Array(N1); this.vd2 = new Float32Array(N2); this.vd3 = new Float32Array(N3);
+  this.vg = new Float32Array(N0); this.vgMax = 0; this.paintT0 = 0; this.paintValid = false;   // ∂L/∂x of all 784 pixels
+  this.vgx = new Float32Array(N0); this.vgxMax = 0;                                             // x·∂L/∂x (what is painted)
+  this.vSample = 0; this.vLabel = 0; this.vPred = 0; this.vLoss = 0; this.vCorrect = true;
+  this.dispX = null; this.dispO = null; this.dispOff = 0;
+  // particles
+  this.px = new Float32Array(PCAP); this.py = new Float32Array(PCAP); this.pvx = new Float32Array(PCAP); this.pvy = new Float32Array(PCAP);
+  this.psx = new Float32Array(PCAP); this.psy = new Float32Array(PCAP); this.ptx = new Float32Array(PCAP); this.pty = new Float32Array(PCAP);
+  this.plife = new Int16Array(PCAP); this.pmax = new Int16Array(PCAP); this.pkind = new Uint8Array(PCAP); this.pjit = new Uint8Array(PCAP);
+  this.alive = 0; this.maxAlive = 0; this.cursor = 0;
+  // training bookkeeping
+  this.hist = new Float32Array(32); this.histN = 0;
+  this.pending = 0; this.streak = 0; this.solveNext = false; this.seed = seed;
+  this.valAcc = 0; this.valLoss = Math.log(10); this.evOk = 0; this.evLoss = 0;
+  this.finalTestAcc = -1; this.finalTestLoss = 0;   // test set: evaluated once, on the model that reached SOLVED
+  this.paradeIdx = new Int32Array(10);
+  this.shx = 0; this.shy = 0;
+  this.evT = new Uint8Array(256); this.evA = new Int16Array(256); this.evV = new Float32Array(256); this.evHead = 0;
+  this.hlChecks = 0; this.hlFails = 0; this.updEma = 0; this.updNorm = 0; this.topkVer = 0; this.topkHash = 0; this.solveReason = 0; this.inputSpawned = 0;
+  // numbers of the highlighted digit shown under the layers, and when each layer is complete in FORWARD / BACKWARD
+  this.inkN = 0; this.actN1 = 0; this.actN2 = 0; this.dN1 = 0; this.dN2 = 0; this.dWn = new Float64Array(3);
+  this.ignF = new Int16Array(4); this.ignB = new Int16Array(4);
+  this.histAcc = new Float32Array(32); this.histTr = new Float32Array(32); this.evalAge = 999;   // per validation pass
+  this.trainStart = -1; this.trainTotal = 0;                                                       // fast-forward progress
+  this.reinit(seed);
+}
+Sim.prototype.reinit = function (seed) {
+  this.seed = seed; this.net.reset(seed); this.computeTopK(); this.updEma = 0; this.emit(EV_RESET, 0, 0);
+  this.histN = 0; this.streak = 0; this.solveNext = false; this.pending = 0; this.finalTestAcc = -1;
+  this.trainStart = -1; this.trainTotal = 0;
+  this.evalVal();
+};
+Sim.prototype.evalVal = function () {
+  this.net.evaluate(valX, valY, NVAL, null);
+  this.valAcc = this.net.lastAcc; this.valLoss = this.net.lastLoss;
+  this.pushHist();
+};
+Sim.prototype.pushHist = function () {   // one point per validation pass: validation loss and accuracy, training loss (EMA)
+  if (this.histN === 32) { this.hist.copyWithin(0, 1); this.histAcc.copyWithin(0, 1); this.histTr.copyWithin(0, 1); this.histN = 31; }
+  this.hist[this.histN] = this.valLoss; this.histAcc[this.histN] = this.valAcc; this.histTr[this.histN] = this.net.trainLoss;
+  this.histN++; this.evalAge = 0;
+};
+Sim.prototype.evalChunk = function (k) {   // k = 0..4, 100 validation digits each
+  const net = this.net;
+  if (k === 0) { this.evOk = 0; this.evLoss = 0; }
+  for (let s = k * 100; s < k * 100 + 100; s++) {
+    net.forward(valX, s * N0);
+    const y = valY[s];
+    if (net.argmax() === y) this.evOk++;
+    this.evLoss += net.nll(y);
+  }
+  if (k === 4) {
+    this.valAcc = this.evOk / NVAL; this.valLoss = this.evLoss / NVAL;
+    this.pushHist();
+    this.emit(EV_EVAL, 0, this.valAcc);
+  }
+};
+Sim.prototype.layerW = function (L) { return L === 0 ? this.net.W1 : L === 1 ? this.net.W2 : this.net.W3; };
+Sim.prototype.layerV = function (L) { return L === 0 ? this.net.vW1 : L === 1 ? this.net.vW2 : this.net.vW3; };
+
+// top-k |w| incoming edges per destination, among drawn sources; plus pulse timing.
+Sim.prototype.computeTopK = function () {
+  const SCR = this.SCR, USED = this.USED;
+  let e = 0;
+  for (let L = 0; L < 3; L++) {
+    const nd = LN[L + 1], W = this.layerW(L), e0 = e;
+    let maxw = 1e-12;
+    for (let d = 0; d < nd; d++) {
+      for (let s = 0; s < 16; s++) { SCR[s] = Math.abs(W[(L === 0 ? SAMPLE_PIX[s] : s) * nd + d]); USED[s] = 0; }
+      for (let k = 0; k < K_TOP; k++) {
+        let best = 0, bv = -1;
+        for (let s = 0; s < 16; s++) if (!USED[s] && SCR[s] > bv) { bv = SCR[s]; best = s; }
+        USED[best] = 1;
+        this.eL[e] = L; this.eS[e] = best; this.eD[e] = d; this.eP[e] = PBASE[L] + best * nd + d;
+        this.eWI[e] = (L === 0 ? SAMPLE_PIX[best] : best) * nd + d; this.eAbs[e] = bv; this.eNeg[e] = W[this.eWI[e]] < 0 ? 1 : 0;
+        this.eFT[e] = 4 + L * 36 + ((d * 5 + k * 3 + L * 2) % 12);
+        this.eBT[e] = BT0 + (2 - L) * BSP + ((d * 3 + k * 5 + L) % 8);
+        if (bv > maxw) maxw = bv;
+        e++;
+      }
+    }
+    for (let q = e0; q < e; q++) {
+      const r = this.eAbs[q] / maxw;
+      this.eRest[q] = r >= 0.6 ? 23 : 2;                       // brightness class
+      this.eWL[q] = Math.min(NWL - 1, Math.floor(r * NWL));     // thickness ∝ |w| relative to the layer's strongest drawn edge
+    }
+  }
+  // forward ignition: a neuron lights only once all its drawn incoming pulses arrived
+  const fT = this.nFwdT, bT = this.nBwdT;
+  fT.fill(0); bT.fill(-1);
+  for (let q = 0; q < NE; q++) {
+    const L = this.eL[q], nd = LOFF[L + 1] + this.eD[q], ns = LOFF[L] + this.eS[q];
+    const fa = this.eFT[q] + TRAVEL; if (fa > fT[nd]) fT[nd] = fa;
+    const ba = this.eBT[q] + TRAVEL_B; if (ba > bT[ns]) bT[ns] = ba;
+  }
+  for (let n = 0; n < 48; n++) if (bT[n] < 0) { const L = n < 16 ? 0 : n < 32 ? 1 : 2; bT[n] = BT0 + (2 - L) * BSP + 7 + TRAVEL_B; }
+  for (let k = 0; k < 10; k++) bT[48 + k] = LOSS_ST[k] + TL_LOSS;   // output δ = ∂L/∂z_k arrives from the loss node
+  let pw = 0; for (let i = 0; i < 16; i++) if (bT[i] + TW > pw) pw = bT[i] + TW;
+  this.paintT0 = pw;                                                // painting starts after every wire reached its pixel
+  // a layer is complete when its last neuron is lit (FORWARD) / shows its δ (BACKWARD): its formula lights then
+  this.ignF.fill(0); this.ignB.fill(0);
+  for (let n = 0; n < NNEU; n++) { const L = layerOf(n); if (fT[n] > this.ignF[L]) this.ignF[L] = fT[n]; if (bT[n] > this.ignB[L]) this.ignB[L] = bT[n]; }
+  // the cached dormant-mesh layer is redrawn only when the drawn set, a sign, a brightness class or a width level changed
+  let h = 2166136261;
+  for (let q = 0; q < NE; q++) { h = Math.imul(h ^ this.eP[q], 16777619); h = Math.imul(h ^ (this.eNeg[q] * 2 + (this.eRest[q] === 23 ? 1 : 0) + this.eWL[q] * 4), 16777619); }
+  if (h !== this.topkHash) { this.topkHash = h; this.topkVer++; }
+};
+
+function lv3(x, m) { return x === 0 || m === 0 ? 0 : x / m < 0.55 ? 1 : 2; }
+Sim.prototype.vizForward = function (X, off) {
+  const net = this.net; net.forward(X, off);
+  for (let i = 0; i < 16; i++) this.vIn[i] = X[off + SAMPLE_PIX[i]];
+  this.va1.set(net.a1); this.va2.set(net.a2); this.vp.set(net.p);
+  this.vPred = net.argmax();
+  const lv = this.fwdLv;
+  let m0 = 0; for (let i = 0; i < 16; i++) if (this.vIn[i] > m0) m0 = this.vIn[i];
+  for (let i = 0; i < 16; i++) lv[i] = lv3(this.vIn[i], m0);          // same rule as the hidden layers
+  let m1 = 0, m2 = 0;
+  for (let i = 0; i < 16; i++) { if (this.va1[i] > m1) m1 = this.va1[i]; if (this.va2[i] > m2) m2 = this.va2[i]; }
+  for (let i = 0; i < 16; i++) {
+    lv[16 + i] = lv3(this.va1[i], m1); lv[32 + i] = lv3(this.va2[i], m2);
+  }
+  for (let k = 0; k < 10; k++) lv[48 + k] = this.vp[k] >= 0.1 ? 1 : 0;   // outputs light above chance (P ≥ 1/10); the winner is drawn high
+};
+function absLevels(src, n, dst, off) {
+  let m = 0; for (let i = 0; i < n; i++) { const a = Math.abs(src[i]); if (a > m) m = a; }
+  for (let i = 0; i < n; i++) dst[off + i] = lv3(Math.abs(src[i]), m);
+}
+Sim.prototype.prepareCycle = function () {
+  this.computeTopK();
+  const net = this.net; net.ensureBatch();
+  const s = net.perm[net.ptr + this.vr.int(BATCH)];        // one real sample of the coming mini-batch
+  this.vSample = s; this.vLabel = trainY[s];
+  this.vizForward(trainX, s * N0);
+  net.deltas(this.vLabel);
+  this.vd1.set(net.d1); this.vd2.set(net.d2); this.vd3.set(net.d3);
+  let gm = 0;
+  for (let i = 0; i < N0; i++) {                            // ∂L/∂x for all 784 pixels (what gets painted)
+    let acc = 0; const r = i * N1;
+    for (let j = 0; j < N1; j++) acc += net.W1[r + j] * net.d1[j];
+    this.vg[i] = acc; if (Math.abs(acc) > gm) gm = Math.abs(acc);
+  }
+  this.vgMax = gm; this.paintValid = false;
+  let gx = 0;                                               // contribution of each pixel: x_i·∂L/∂x_i (0 where there is no ink)
+  for (let i = 0; i < N0; i++) { this.vgx[i] = trainX[s * N0 + i] * this.vg[i]; const a = Math.abs(this.vgx[i]); if (a > gx) gx = a; }
+  this.vgxMax = gx;
+  for (let i = 0; i < 16; i++) this.vd0[i] = this.vg[SAMPLE_PIX[i]];   // the 16 drawn input neurons
+  this.vLoss = net.nll(this.vLabel);                         // −ln p_y in the log domain (same forward pass)
+  let ink = 0; for (let i = 0; i < N0; i++) if (trainX[s * N0 + i] > 0) ink++;
+  let a1 = 0, a2 = 0, e1 = 0, e2 = 0;                        // active neurons (a > 0) and non-zero errors (δ ≠ 0) per hidden layer
+  for (let i = 0; i < 16; i++) { if (this.va1[i] > 0) a1++; if (this.va2[i] > 0) a2++; if (this.vd1[i] !== 0) e1++; if (this.vd2[i] !== 0) e2++; }
+  this.inkN = ink; this.actN1 = a1; this.actN2 = a2; this.dN1 = e1; this.dN2 = e2;
+  this.vCorrect = this.vPred === this.vLabel;
+  absLevels(this.vd0, 16, this.bwdLv, 0); absLevels(this.vd1, 16, this.bwdLv, 16);
+  absLevels(this.vd2, 16, this.bwdLv, 32); absLevels(this.vd3, 10, this.bwdLv, 48);
+  // pulse intensities: forward |w*a_prev|, backward |dW| = |delta_dst * a_prev|
+  const MX = this.MX, MX2 = this.MX2; MX.fill(1e-12); MX2.fill(1e-12);
+  for (let e = 0; e < NE; e++) {
+    const L = this.eL[e], sI = this.eS[e], dI = this.eD[e];
+    const a = L === 0 ? this.vIn[sI] : L === 1 ? this.va1[sI] : this.va2[sI];
+    const dd = L === 0 ? this.vd1[dI] : L === 1 ? this.vd2[dI] : this.vd3[dI];
+    const f = Math.abs(this.layerW(L)[this.eWI[e]] * a), b = Math.abs(dd * a);
+    this.eFI[e] = f; this.eBI[e] = b; this.eBNeg[e] = dd * a < 0 ? 1 : 0;
+    if (f > MX[L]) MX[L] = f; if (b > MX2[L]) MX2[L] = b;
+  }
+  for (let e = 0; e < NE; e++) { const L = this.eL[e]; this.eFI[e] /= MX[L]; this.eBI[e] /= MX2[L]; }
+  this.dispX = trainX; this.dispO = trainO; this.dispOff = s * N0;
+};
+function sumsq(a) { let s = 0; for (let i = 0; i < a.length; i++) s += a[i] * a[i]; return s; }
+Sim.prototype.applyUpdate = function () {
+  const net = this.net; net.ensureBatch();
+  let inB = false;                                          // the highlighted sample must belong to this batch
+  for (let b = 0; b < BATCH; b++) if (net.perm[net.ptr + b] === this.vSample) inB = true;
+  this.hlChecks++; if (!inB) this.hlFails++;
+  net.trainStep();
+  const MX = this.MX; MX.fill(1e-12);
+  for (let e = 0; e < NE; e++) {
+    const L = this.eL[e], dv = this.layerV(L)[this.eWI[e]], a = Math.abs(dv);   // velocity == applied Δw
+    this.eFl[e] = a; this.eUNeg[e] = dv < 0 ? 1 : 0; if (a > MX[L]) MX[L] = a;
+  }
+  for (let e = 0; e < NE; e++) this.eFl[e] /= MX[this.eL[e]];
+  // ||Δθ||₂ over every parameter of the network (not only drawn edges)
+  const nrm = Math.sqrt(sumsq(net.vW1) + sumsq(net.vb1) + sumsq(net.vW2) + sumsq(net.vb2) + sumsq(net.vW3) + sumsq(net.vb3));
+  this.updEma = this.updEma > 0 ? this.updEma * 0.8 + nrm * 0.2 : nrm;
+  this.updNorm = nrm;
+  this.dWn[0] = Math.sqrt(sumsq(net.vW1)); this.dWn[1] = Math.sqrt(sumsq(net.vW2)); this.dWn[2] = Math.sqrt(sumsq(net.vW3));   // ‖ΔW_l‖
+  this.emit(EV_UPDATE, 0, nrm / this.updEma);
+};
+Sim.prototype.runPending = function (maxN) {
+  const t0 = this.budgetMs > 0 ? nowMs() : 0;
+  let n = 0;
+  while (this.pending > 0 && n < maxN) {
+    this.net.trainStep(); this.pending--; n++;
+    if (this.budgetMs > 0 && nowMs() - t0 > this.budgetMs) break;
+  }
+  if (n > 0 && this.state === ST_TRAIN) this.emit(EV_TICK, n, this.net.trainLoss);
+};
+Sim.prototype.checkSolved = function () {   // decided on the validation set, never on the test set
+  if (this.noSolve) return;
+  if (this.valAcc >= 0.95) this.streak++; else this.streak = 0;
+  if (this.streak >= 2) { this.solveNext = true; this.solveReason = 1; }
+  else if (this.net.steps >= MAX_STEPS) { this.solveNext = true; this.solveReason = 2; }
+};
+Sim.prototype.pickParade = function () {   // the one evaluation of the test set: the final model, chosen on validation
+  const net = this.net; let any = -1, ok = 0, loss = 0;
+  this.paradeIdx.fill(-1);
+  for (let s = 0; s < NTEST; s++) {
+    net.forward(testX, s * N0);
+    const y = testY[s];
+    loss += net.nll(y);
+    if (net.argmax() === y) { ok++; if (any < 0) any = s; if (this.paradeIdx[y] < 0) this.paradeIdx[y] = s; }
+  }
+  this.finalTestAcc = ok / NTEST; this.finalTestLoss = loss / NTEST;
+  for (let c = 0; c < 10; c++) if (this.paradeIdx[c] < 0) this.paradeIdx[c] = any < 0 ? c : any;
+};
+Sim.prototype.scanX = function (t) { return Math.round(scanSmooth(t - t % 5)); };
+
+Sim.prototype.emit = function (type, a, v) {
+  const i = this.evHead & 255; this.evT[i] = type; this.evA[i] = a; this.evV[i] = v; this.evHead++;
+};
+// x of the active wave front (forward/backward/solved scan), -1000 when none; shared by renderer and audio
+Sim.prototype.frontX = function () { return frontSmooth(this.state, this.t - this.t % 5, this.paintT0); };
+
+// --- particles (pooled, allocation-free)
+Sim.prototype.spawn = function (x, y, vx, vy, life, kind, jit) {
+  if (this.alive >= PCAP) return -1;
+  for (let q = 0; q < PCAP; q++) {
+    const i = (this.cursor + q) % PCAP;
+    if (this.plife[i] > 0) continue;
+    this.px[i] = x; this.py[i] = y; this.pvx[i] = vx; this.pvy[i] = vy;
+    this.plife[i] = life; this.pmax[i] = life; this.pkind[i] = kind; this.pjit[i] = jit;
+    this.cursor = (i + 1) % PCAP; this.alive++;
+    if (this.alive > this.maxAlive) this.maxAlive = this.alive;
+    return i;
+  }
+  return -1;
+};
+Sim.prototype.sparkNeuron = function (n, count, kind) { this.sparkAt(NX[n] + 2, NY[n] + 2, count, kind); };
+Sim.prototype.sparkAt = function (cx, cy, count, kind) {
+  const r = this.vr;
+  for (let c = 0; c < count; c++) {
+    const a = r.next() * 2 * PI, sp = 0.3 + r.next() * 0.6;
+    this.spawn(cx, cy, Math.cos(a) * sp, Math.sin(a) * sp, 6 + r.int(7), kind, kind);
+  }
+};
+Sim.prototype.spawnInput = function () {
+  this.inputSpawned = 0;
+  for (let i = 0; i < 16; i++) {
+    if (this.vIn[i] === 0) continue;
+    const pix = SAMPLE_PIX[i], k = this.spawn(DIG_X + pix % 28, DIG_Y + ((pix / 28) | 0), 0, 0, 8, 2, 0);
+    if (k < 0) continue;
+    this.psx[k] = DIG_X + pix % 28; this.psy[k] = DIG_Y + ((pix / 28) | 0);
+    this.ptx[k] = NX[i] + 2; this.pty[k] = NY[i] + 2; this.inputSpawned++;
+  }
+};
+Sim.prototype.lossNodeBurst = function () {
+  const r = this.vr, count = 4 + Math.round(32 * (1 - Math.exp(-this.vLoss)));
+  for (let c = 0; c < count; c++) {
+    const a = r.next() * 2 * PI, sp = 0.3 + r.next() * 0.9;
+    this.spawn(LOSS_X - 0.5, LOSS_Y - 0.5, Math.cos(a) * sp, Math.sin(a) * sp, 8 + r.int(12), 1, 1);
+  }
+};
+Sim.prototype.paintSparks = function (t) {   // sparks on strongly-painted pixels at the sweep front
+  const f = (t - this.paintT0) / PAINT_D, xc = 28 - f * 28, r = this.vr;
+  let n = 0;
+  for (let c = Math.max(0, Math.floor(xc - 3)); c < Math.min(28, Math.ceil(xc)); c++) for (let row = 0; row < 28 && n < 8; row++) {
+    const v = this.vgx[row * 28 + c], m = this.vgxMax > 0 ? Math.abs(v) / this.vgxMax : 0;
+    if (m > 0.35 && r.next() < m * 0.6) { this.spawn(DIG_X + c, DIG_Y + row, -0.2 - r.next() * 0.4, (r.next() - 0.5) * 0.6, 6 + r.int(8), v > 0 ? 1 : 0, 1); n++; }
+  }
+  this.emit(EV_PAINT, n, f);
+};
+Sim.prototype.burst = function () {
+  const n = 48 + this.vLabel, cx = NX[n] + 2, cy = NY[n] + 2, r = this.vr;
+  const count = 6 + Math.round(42 * (1 - Math.exp(-this.vLoss)));     // grows with 1 − p_y
+  for (let c = 0; c < count; c++) {
+    const a = r.next() * 2 * PI, sp = 0.4 + r.next() * 1.1;
+    this.spawn(cx, cy, Math.cos(a) * sp, Math.sin(a) * sp, 10 + r.int(13), 1, 1);
+  }
+};
+Sim.prototype.pulseSparks = function (fwd, t) {
+  const r = this.vr, I_ = fwd ? this.eFI : this.eBI, T_ = fwd ? this.eFT : this.eBT, TV = fwd ? TRAVEL : TRAVEL_B;
+  for (let e = 0; e < NE; e++) {
+    const I = I_[e]; if (I < 0.4) continue;
+    const dt = t - T_[e]; if (dt < 0 || dt >= TV) continue;
+    if (r.next() > I * 0.5) continue;
+    const p = this.eP[e], n = PLEN[p], h = (dt * n / TV) | 0;
+    const pos = PPIX[POFF[p] + (fwd ? h : n - 1 - h)];
+    const sp = 0.15 + r.next() * 0.4;
+    this.spawn(pos & 255, pos >> 8, fwd ? sp : -sp, (r.next() - 0.5) * (fwd ? 0.5 : 0.9), 8 + r.int(8), fwd ? 0 : 1, fwd ? 0 : 1);
+  }
+  const T = fwd ? this.nFwdT : this.nBwdT, LV = fwd ? this.fwdLv : this.bwdLv;
+  for (let n = fwd ? 16 : 0; n < NNEU; n++) {
+    if (t >= T[n] && t - 5 < T[n] && LV[n] > 0) { this.sparkNeuron(n, 1 + LV[n] * 2, fwd ? 0 : 1); this.emit(fwd ? EV_IGNF : EV_IGNB, n, LV[n]); }
+  }
+  if (!fwd) for (let i = 0; i < 16; i++) {      // ∂L/∂x_i reaches its pixel through the wire
+    const ta = this.nBwdT[i] + TW;
+    if (t >= ta && t - 5 < ta && this.bwdLv[i] > 0) {
+      const pix = SAMPLE_PIX[i]; this.sparkAt(DIG_X + pix % 28, DIG_Y + ((pix / 28) | 0), 1 + this.bwdLv[i], 1); this.emit(EV_WIRE, i, this.bwdLv[i]);
+    }
+  }
+};
+Sim.prototype.updateParticles = function () {
+  const r = this.vr;
+  for (let i = 0; i < PCAP; i++) {
+    if (this.plife[i] <= 0) continue;
+    if (this.pkind[i] !== 2) {
+      this.px[i] += this.pvx[i]; this.py[i] += this.pvy[i];
+      this.pvx[i] *= 0.93; this.pvy[i] *= 0.93;
+      if (this.pjit[i]) { this.pvx[i] += (r.next() - 0.5) * 0.25; this.pvy[i] += (r.next() - 0.5) * 0.25; }
+    }
+    if (--this.plife[i] <= 0) this.alive--;
+  }
+};
+
+// --- state machine (fixed 60 Hz step)
+Sim.prototype.enter = function (st) {
+  switch (st) {
+    case ST_INPUT: this.prepareCycle(); break;
+    case ST_LOSS: this.burst(); break;
+    case ST_BACKWARD: this.paintValid = true; break;
+    case ST_UPDATE: this.applyUpdate(); break;
+    case ST_TRAIN: this.pending += TRAIN_STEPS_PER_FRAME * DUR[ST_TRAIN]; this.trainStart = this.net.steps; this.trainTotal = this.pending; break;
+    case ST_SOLVED: this.solveNext = false; this.paintValid = false; this.pickParade(); break;
+  }
+};
+Sim.prototype.logic = function (st, t) {
+  const tick = (t % 5) === 0;
+  switch (st) {
+    case ST_IDLE: if (this.pending > 0) { this.runPending(4); this.computeTopK(); } break;
+    case ST_INPUT:
+      if (t < 10 && (t & 1) === 0) this.emit(EV_WRITE, t, t / 10);
+      if (t === 12) { this.spawnInput(); this.emit(EV_LAUNCH, 0, 0); }
+      if (t === 20) { let c = 0; for (let i = 0; i < 16; i++) if (this.fwdLv[i] > 0) c++; this.emit(EV_ARRIVE, c, 0); }
+      break;
+    case ST_FORWARD: if (tick) this.pulseSparks(true, t); break;
+    case ST_SOFTMAX:
+      if (t === 10) { this.sparkNeuron(48 + this.vPred, 6, 0); this.emit(EV_PRED, this.vPred, this.vCorrect ? 1 : 0); }
+      if (t === 24 && !this.vCorrect) this.emit(EV_GLITCH, 0, 0);
+      break;
+    case ST_LOSS:          // p_y travels to the loss node; when it arrives L = −ln p_y is computed
+      if (t === TL_LOSS) { this.lossNodeBurst(); this.emit(EV_LOSS, this.vLabel, this.vLoss); }
+      if (t >= TL_LOSS && t < TL_LOSS + 10 && this.vLoss > 0.05) {
+        const ph = ((t - TL_LOSS) >> 1) & 3;
+        this.shx = ph === 0 ? 1 : ph === 1 ? -1 : 0; this.shy = ph === 2 ? 1 : ph === 3 ? -1 : 0;
+      }
+      break;
+    case ST_BACKWARD:
+      if (tick) this.pulseSparks(false, t);
+      if (tick && t >= this.paintT0 && t < this.paintT0 + PAINT_D) this.paintSparks(t);
+      break;
+    case ST_UPDATE: if (t === 30) this.computeTopK(); break;
+    case ST_TRAIN:
+      { // three validation-set evaluations per cycle, each spread over 5 frames with weights frozen;
+        // the training steps skipped on those frames are caught up during IDLE.
+        const ep = t >= 17 && t <= 21 ? t - 17 : t >= 39 && t <= 43 ? t - 39 : t >= 60 && t <= 64 ? t - 60 : -1;
+        if (ep >= 0) this.evalChunk(ep); else { this.runPending(TRAIN_STEPS_PER_FRAME); this.computeTopK(); }
+      }
+      if (t === 64) { this.computeTopK(); this.checkSolved(); }
+      break;
+    case ST_SOLVED:
+      if (t < 120 && tick) {
+        const xs = this.scanX(t);
+        this.emit(EV_SCAN, xs, t < 60 ? 1 : -1);
+        for (let n = 0; n < NNEU; n++) if (Math.abs(NX[n] + 2 - xs) < 3) this.sparkNeuron(n, 2, t < 60 ? 0 : 1);
+      }
+      if (t >= 120 && (t - 120) % 12 === 0) {
+        const s = this.paradeIdx[((t - 120) / 12) | 0];
+        this.vizForward(testX, s * N0); this.vLabel = testY[s];
+        this.dispX = testX; this.dispO = testO; this.dispOff = s * N0;
+        this.sparkNeuron(48 + this.vPred, 4, 0); this.emit(EV_PARADE, this.vPred, 0);
+      }
+      if (t === DUR[ST_SOLVED] - 1) this.reinit(this.seed + 1);
+      break;
+  }
+};
+Sim.prototype.step = function () {
+  const st = this.state, t = this.t;
+  this.shx = 0; this.shy = 0;
+  this.logic(st, t);
+  this.updateParticles();
+  if (this.evalAge < 999) this.evalAge++;
+  this.frame++;
+  if (++this.t >= DUR[st]) {
+    this.t = 0;
+    this.state = st === ST_TRAIN ? (this.solveNext ? ST_SOLVED : ST_IDLE) : st === ST_SOLVED ? ST_IDLE : st + 1;
+    this.emit(EV_STATE, this.state, 0); this.enter(this.state);
+  }
+};
+
+// ---------------------------------------------------------------- vector renderer (native device resolution)
+// The 256×144 layout is a logical coordinate system. Everything is drawn as vectors through one transform at
+// the display's full pixel density (3840×2160 on a 4K screen). Parts that only change when the top-k edges are
+// recomputed (dot texture, dormant mesh, frames, labels) are cached in a static layer; the rest is redrawn per frame.
+let VW = 0, VH = 0, K = 1, OX = 0, OY = 0, ADV = 0.6;
+let MAKE_CANVAS = null, STATIC = null, STATIC_KEY = -1, SPR = null, DIGC = null, DIGX = null, DIGI = null, PNTC = null, PNTX = null, PNTI = null;
+const RANK = new Float32Array(784);   // fixed random order in which pixels dissolve during IDLE
+(function () { const r = new Rng(4242); for (let i = 0; i < 784; i++) RANK[i] = r.next(); })();
+let UI_SOUND = 0, UI_PAUSED = false, UI_SPEED = 0, UI_BLINK = 0;   // sound: 0 never enabled / 1 on / 2 muted
+const SPEEDS = [1, 0.5, 0.25];
+const TAU = 2 * PI;
+const MONO = '"SF Mono", "Cascadia Mono", "JetBrains Mono", "Roboto Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace';
+const FS_TOP = 6, FS_LBL = 4.6, FS_OUT = 5.6;
+const FS_LEG = 4.2, F_LEG = '500 4.2px ' + MONO;
+const F_TOP = '600 6px ' + MONO, F_LBL = '500 4.6px ' + MONO, F_OUT = '600 5.6px ' + MONO;
+const FS_KEYT = 3.4, F_KEYT = '600 3.4px ' + MONO, FS_TINY = 2.6, F_TINY = '500 2.6px ' + MONO, FS_CHIP = 2.8, F_CHIP = '600 2.8px ' + MONO,
+      FS_CARD = 3.0, F_CARD = '600 3px ' + MONO, FS_CARDV = 3.6, F_CARDV = '600 3.6px ' + MONO, FS_AX = 2.2, F_AX = '500 2.2px ' + MONO,
+      FS_FOOT = 3.0, F_FOOT = '500 3px ' + MONO, FS_LEGC = 2.4, F_LEGC = '500 2.4px ' + MONO, DOTS06 = [0.001, 0.75], DASH05 = [0.5, 0.5];
+const DASH = [0.9, 0.9], DOTS = [0.001, 2], DOTS16 = [0.001, 1.6], NODASH = [];
+const NLV = new Uint8Array(NNEU), NMD = new Uint8Array(NNEU);
+let CUR_FS = 6;
+
+function setViewport(w, h) {
+  VW = w; VH = h; K = Math.min(w / LW, h / LH); OX = (w - LW * K) / 2; OY = (h - LH * K) / 2;
+  STATIC_KEY = -1;
+  // radial glow sprites, one per palette color, sized to the device resolution (no per-frame gradients)
+  const S = Math.max(16, Math.ceil(10 * K)); SPR = [];
+  for (let i = 0; i < PAL_HEX.length; i++) {
+    const cv = MAKE_CANVAS(S, S), x = cv.getContext('2d'), hx = PAL_HEX[i];
+    const rgb = parseInt(hx.substr(1, 2), 16) + ',' + parseInt(hx.substr(3, 2), 16) + ',' + parseInt(hx.substr(5, 2), 16);
+    const g = x.createRadialGradient(S / 2, S / 2, 0, S / 2, S / 2, S / 2);
+    g.addColorStop(0, 'rgba(' + rgb + ',1)'); g.addColorStop(0.18, 'rgba(' + rgb + ',0.6)');
+    g.addColorStop(0.45, 'rgba(' + rgb + ',0.16)'); g.addColorStop(1, 'rgba(' + rgb + ',0)');
+    x.fillStyle = g; x.fillRect(0, 0, S, S); SPR.push(cv);
+  }
+  const m = MAKE_CANVAS(8, 8).getContext('2d'); m.font = '600 100px ' + MONO; ADV = m.measureText('0').width / 100;
+  // 7-segment LED: each segment with its blurred glow, blue and magenta, rendered once (no per-frame shadowBlur)
+  LEDG = [];
+  for (let col = 0; col < 2; col++) for (let sg = 0; sg < 7; sg++) {
+    let x0 = 99, y0 = 99, x1 = -99, y1 = -99;
+    for (let k = 0; k < 6; k++) { const px = LEDP[sg * 12 + 2 * k], py = LEDP[sg * 12 + 2 * k + 1]; x0 = Math.min(x0, px); x1 = Math.max(x1, px); y0 = Math.min(y0, py); y1 = Math.max(y1, py); }
+    x0 -= LEDM; y0 -= LEDM; x1 += LEDM; y1 += LEDM;
+    const cv = MAKE_CANVAS(Math.ceil((x1 - x0) * K), Math.ceil((y1 - y0) * K)), x = cv.getContext('2d');
+    x.setTransform(K, 0, 0, K, -x0 * K, -y0 * K);
+    x.shadowColor = PAL_HEX[col ? 12 : 6]; x.shadowBlur = 2.6 * K; x.fillStyle = PAL_HEX[col ? 12 : 6];
+    x.beginPath(); x.moveTo(LEDP[sg * 12], LEDP[sg * 12 + 1]);
+    for (let k = 1; k < 6; k++) x.lineTo(LEDP[sg * 12 + 2 * k], LEDP[sg * 12 + 2 * k + 1]);
+    x.closePath(); x.fill();
+    LEDGX[col * 7 + sg] = x0; LEDGY[col * 7 + sg] = y0; LEDG.push(cv);
+  }
+  // widths of every static formula token per unit of font size (sub/superscripts are set at 70 %)
+  const FI = 'italic 400 100px ' + SERIF, FU = '400 100px ' + SERIF, F7 = '400 70px ' + SERIF, FW = '500 100px ' + MONO;
+  for (let f = 0; f < ALLF.length; f++) for (let i = 0; i < ALLF[f].length; i++) {
+    const t = ALLF[f][i]; if (t.k > TK_M) continue;
+    m.font = t.k === TK_I ? FI : t.k === TK_U ? FU : t.k === TK_M ? FW : F7;
+    t.w = m.measureText(t.s).width / 100;
+  }
+  m.font = F7; for (let e = 0; e <= 60; e++) EXPW[e] = m.measureText(EXPS[e]).width / 100;
+}
+let LEDG = null;
+const LEDM = 4.2, LEDGX = new Float32Array(14), LEDGY = new Float32Array(14);   // glow margin (logical units), sprite origins
+function setFont(c, f, fs) { c.font = f; CUR_FS = fs; }
+function textW(n) { return n * ADV * CUR_FS; }
+function text(c, s, x, y, ci) { c.fillStyle = PAL_HEX[ci]; c.fillText(s, x, y); return x + s.length * ADV * CUR_FS; }
+function digits(c, v, nd, x, y) {
+  const a = ADV * CUR_FS;
+  for (let i = nd - 1; i >= 0; i--) { c.fillText(DIG[v % 10], x + i * a, y); v = (v / 10) | 0; }
+  return x + nd * a;
+}
+const POW10 = [1, 10, 100, 1000, 10000, 100000, 1000000];
+function fixed(c, v, dec, x, y) {   // v with `dec` decimals in the current fill style, allocation-free; returns new x
+  const m = POW10[dec], n = Math.round(v * m), ip = Math.floor(n / m), fp = n - ip * m;
+  x = digits(c, ip, ip >= 100 ? 3 : ip >= 10 ? 2 : 1, x, y); c.fillText('.', x, y); x += ADV * CUR_FS;
+  return digits(c, fp, dec, x, y);
+}
+// ---------------------------------------------------------------- math typesetting for the on-screen data
+// Each formula is a list of tokens built once at load: italic variables, upright operators and function names,
+// sub/superscripts at 70 %, monospace words, and live numbers read from LV[] (filled every frame from the simulation).
+// Static token widths are measured once per viewport, so formulas are centred and drawn without allocating.
+const SERIF = '"Latin Modern Roman", "STIX Two Text", Cambria, "Times New Roman", "Liberation Serif", "DejaVu Serif", serif';
+const TK_I = 0, TK_U = 1, TK_SUB = 2, TK_SUP = 3, TK_M = 4, TK_INT = 5, TK_FIX = 6, TK_SGN = 7, TK_SIG = 8;
+const RO_V = 0, RO_O = 1, RO_N = 2, RO_L = 3;        // role → entry of a theme: variable, operator, number, word
+function Tok(k, s, r, slot, dec) { this.k = k; this.s = s; this.r = r; this.slot = slot; this.dec = dec; this.w = 0; }
+function mI(s) { return new Tok(TK_I, s, RO_V, 0, 0); }      // italic variable
+function mU(s) { return new Tok(TK_U, s, RO_O, 0, 0); }      // upright: operators, constants, function names
+function mB(s) { return new Tok(TK_SUB, s, RO_V, 0, 0); }    // subscript
+function mP(s) { return new Tok(TK_SUP, s, RO_V, 0, 0); }    // superscript
+function mW(s) { return new Tok(TK_M, s, RO_L, 0, 0); }      // monospace words
+function nI(v) { return new Tok(TK_INT, '', RO_N, v, 0); }        // live integer
+function nF(v, d) { return new Tok(TK_FIX, '', RO_N, v, d); }     // live value ≥ 0, d decimals
+function nS(v, d) { return new Tok(TK_SGN, '', RO_N, v, d); }     // live signed value, d decimals
+function nG(v, d) { return new Tok(TK_SIG, '', RO_N, v, d); }     // live value ≥ 0, d significant digits (×10ⁿ below 0.001)
+const ALLF = [];
+function FM() { const a = []; for (let i = 0; i < arguments.length; i++) a.push(arguments[i]); ALLF.push(a); return a; }
+function FontSet(sz) {
+  this.sz = sz; this.I = 'italic 400 ' + sz + 'px ' + SERIF; this.U = '400 ' + sz + 'px ' + SERIF;
+  this.S = '400 ' + Math.round(sz * 70) / 100 + 'px ' + SERIF; this.M = '500 ' + sz + 'px ' + MONO; this.N = '600 ' + sz + 'px ' + MONO;
+}
+const FSA = new FontSet(3.6), FSB = new FontSet(3.2), FSR = new FontSet(3.9), FSC = new FontSet(3.0), FSK = new FontSet(3.8);
+// themes: palette index per role [variable, operator, number, word]
+const TH_FWD = new Uint8Array([7, 18, 9, 18]), TH_BWD = new Uint8Array([13, 18, 9, 18]), TH_UPD = new Uint8Array([8, 18, 9, 18]),
+      TH_DIM = new Uint8Array([20, 20, 20, 20]), TH_STAT = new Uint8Array([19, 20, 19, 20]), TH_RES = new Uint8Array([18, 19, 9, 19]),
+      TH_RES2 = new Uint8Array([18, 19, 18, 19]), TH_ROWC = new Uint8Array([18, 20, 18, 20]), TH_LBL = new Uint8Array([19, 19, 19, 19]),
+      TH_KA = new Uint8Array([7, 7, 7, 7]), TH_KD = new Uint8Array([13, 13, 13, 13]);
+// live values
+const LV = new Float64Array(24);
+const V_INK = 0, V_A1 = 1, V_A2 = 2, V_PRED = 3, V_PPRED = 4, V_Y = 5, V_PY = 6, V_L = 7, V_D3Y = 8, V_D2 = 9, V_D1 = 10,
+      V_GXM = 11, V_DW1 = 12, V_DW2 = 13, V_DW3 = 14, V_STEP = 15, V_EPOCH = 16, V_LOTE = 17, V_TRDONE = 18, V_TRN = 19;
+const BPE = Math.floor(NTRAIN / BATCH);                                       // mini-batches per epoch (93)
+const NPARAM = N0 * N1 + N1 + N1 * N2 + N2 + N2 * N3 + N3;                     // 13 002
+const NPARAM_TXT = String(NPARAM).replace(/\B(?=(\d{3})+(?!\d))/g, ' ');   // "13 002"
+// row A (under each column): what the layer computes. Row B: this digit's numbers for it.
+const FA_FWD = [
+  FM(mI('x'), mU(' ∈ [0, 1]'), mP('784')),
+  FM(mI('h'), mB('1'), mU(' = ReLU('), mI('W'), mB('1'), mI('x'), mU(' + '), mI('b'), mB('1'), mU(')')),
+  FM(mI('h'), mB('2'), mU(' = ReLU('), mI('W'), mB('2'), mI('h'), mB('1'), mU(' + '), mI('b'), mB('2'), mU(')')),
+  FM(mI('P'), mU(' = softmax('), mI('W'), mB('3'), mI('h'), mB('2'), mU(' + '), mI('b'), mB('3'), mU(')'))];
+const FA_BWD = [
+  FM(mU('∂'), mI('L'), mU('/∂'), mI('x'), mU(' = '), mI('W'), mB('1'), mP('T'), mI('δ'), mB('1')),
+  FM(mI('δ'), mB('1'), mU(' = '), mI('W'), mB('2'), mP('T'), mI('δ'), mB('2'), mU(' ⊙ ['), mI('z'), mB('1'), mU(' > 0]')),
+  FM(mI('δ'), mB('2'), mU(' = '), mI('W'), mB('3'), mP('T'), mI('δ'), mB('3'), mU(' ⊙ ['), mI('z'), mB('2'), mU(' > 0]')),
+  FM(mI('δ'), mB('3'), mU(' = '), mI('P'), mU(' − '), mI('y'))];
+const FA_UPD = [
+  FM(mI('v'), mU(' ← '), mI('μv'), mU(' − '), mI('η'), mU(' ∂'), mI('L'), mU('/∂'), mI('W')),
+  FM(mI('W'), mB('1'), mU(' ← '), mI('W'), mB('1'), mU(' + '), mI('v'), mB('1')),
+  FM(mI('W'), mB('2'), mU(' ← '), mI('W'), mB('2'), mU(' + '), mI('v'), mB('2')),
+  FM(mI('W'), mB('3'), mU(' ← '), mI('W'), mB('3'), mU(' + '), mI('v'), mB('3'))];
+const FB_FWD = [
+  FM(nI(V_INK), mW(' px con tinta')),
+  FM(nI(V_A1), mW(' de 16 activas')),
+  FM(nI(V_A2), mW(' de 16 activas')),
+  FM(mU('máx '), mI('P'), mU('('), nI(V_PRED), mU(') = '), nF(V_PPRED, 3))];
+const FB_BWD = [
+  FM(mU('máx |'), mI('x'), mU('·∂'), mI('L'), mU('/∂'), mI('x'), mU('| = '), nG(V_GXM, 3)),
+  FM(nI(V_D1), mW(' de 16 ≠ 0')),
+  FM(nI(V_D2), mW(' de 16 ≠ 0')),
+  FM(mI('δ'), mB('3'), mU('('), nI(V_Y), mU(') = '), nS(V_D3Y, 4))];
+const FB_UPD = [
+  FM(mI('η'), mU(' = ' + LR + ',   '), mI('μ'), mU(' = ' + MOM)),
+  FM(mU('‖Δ'), mI('W'), mB('1'), mU('‖ = '), nG(V_DW1, 3)),
+  FM(mU('‖Δ'), mI('W'), mB('2'), mU('‖ = '), nG(V_DW2, 3)),
+  FM(mU('‖Δ'), mI('W'), mB('3'), mU('‖ = '), nG(V_DW3, 3))];
+const FB_SIZE = [
+  FM(mW('16 de 784 dibujadas')),
+  FM(mI('W'), mB('1'), mU(': 16×784   '), mI('b'), mB('1'), mU(': 16')),
+  FM(mI('W'), mB('2'), mU(': 16×16   '), mI('b'), mB('2'), mU(': 16')),
+  FM(mI('W'), mB('3'), mU(': 10×16   '), mI('b'), mB('3'), mU(': 10'))];
+const FB_TRAIN = FM(nI(V_TRDONE), mW(' de '), nI(V_TRN), mW(' pasos'));
+// right column: prediction, true label, and this digit's loss worked out step by step
+const FR_PRED = FM(mI('P'), mU('('), nI(V_PRED), mU(') = '), nF(V_PPRED, 3));
+const FR_Y = FM(mI('y'), mU(' = '), nI(V_Y));
+const FR_LHEAD = FM(mI('L'), mU(' '));
+const FR_L1 = FM(mI('L'), mU(' = −ln '), mI('P'), mU('('), nI(V_Y), mU(')'));
+const FR_L2 = FM(mU('= −ln '), nG(V_PY, 4));
+const FR_L3 = FM(mU('= '), nF(V_L, 3)), FR_L3B = FM(mU('= '), nF(V_L, 2));
+const FP_TITLE = FM(mI('x'), mU('·∂'), mI('L'), mU('/∂'), mI('x'));
+const FK_A = FM(mI('a')), FK_D = FM(mI('δ')), FK_X = FM(mI('x'));
+const FC_STATUS = FM(mW('PASO '), nI(V_STEP), mW(' · ÉPOCA '), nI(V_EPOCH), mW(' · LOTE '), nI(V_LOTE),
+  mW('/' + BPE + ' · LOTES DE ' + BATCH + ' · '), mI('η'), mU(' = ' + LR + ' · '), mI('μ'), mU(' = ' + MOM + ' · '),
+  mW(NPARAM_TXT + ' PARÁMETROS'));
+const EXPS = []; for (let e = 0; e <= 60; e++) EXPS.push('−' + e);   // exponents of tiny probabilities
+const EXPW = new Float32Array(61);
+// paint scale: the painted pixel colors at their opacity, from −max (blue, lowers L) through 0 to +max (pink, raises L)
+const PBAR = [];
+for (let i = 0; i < 22; i++) {
+  const f = (i + 0.5) / 22, a = Math.abs(f - 0.5) * 2 * 240 / 255, pos = f > 0.5;
+  PBAR.push('rgb(' + Math.round((pos ? 255 : 69) * a) + ',' + Math.round((pos ? 64 : 180) * a) + ',' + Math.round((pos ? 180 : 255) * a) + ')');
+}
+const SLOT_X = new Float32Array([LX[0] + 2.5, LX[1] + 2.5, LX[2] + 2.5, LX[3] + 2.5]);
+const ROW_A = 131.4, ROW_B = 136.9, ROW_C = 142.6;                       // formula row, value row, status row
+const CARD_X = 211.2, CARD_Y = 105.4, CARD_W = 42.3, CARD_H = 38.0;       // learning card (right column, bottom), clear of the P → L fan
+const CH_X = 213.1, CH_W = 34.6, LCH_Y = 111.7, ACH_Y = 130.3, CH_H = 9;   // its two charts (scale labels at the right)
+const LMAX = 2.5;                                                         // loss chart range 0 … 2.5
+
+function sigDec(v, sig) { if (!(v > 0)) return sig - 1; const d = sig - 1 - Math.floor(Math.log10(v)); return d < 0 ? 0 : d > 6 ? 6 : d; }
+function intDigits(ip) { return ip >= 100000 ? 6 : ip >= 10000 ? 5 : ip >= 1000 ? 4 : ip >= 100 ? 3 : ip >= 10 ? 2 : 1; }
+function numChars(v, dec) { const m = POW10[dec], n = Math.round(v * m); return intDigits(Math.floor(n / m)) + (dec > 0 ? dec + 1 : 0); }
+function pnum(c, v, dec, x, y) {   // v ≥ 0 with `dec` decimals (0 = integer) in the current font; allocation-free
+  const m = POW10[dec], n = Math.round(v * m), ip = Math.floor(n / m), fp = n - ip * m;
+  x = digits(c, ip, intDigits(ip), x, y);
+  if (dec > 0) { c.fillText('.', x, y); x = digits(c, fp, dec, x + ADV * CUR_FS, y); }
+  return x;
+}
+let SCI_M = 0, SCI_E = 0;
+function sci(v, sig) {   // v = SCI_M × 10^SCI_E with SCI_M shown to `sig` significant digits
+  let e = Math.floor(Math.log10(v)), m = v / Math.pow(10, e); const k = POW10[sig - 1];
+  if (Math.round(m * k) >= 10 * k) { m /= 10; e++; }
+  SCI_M = m; SCI_E = e;
+}
+function tokW(t, FS) {
+  if (t.k <= TK_M) return t.w * FS.sz;
+  const v = LV[t.slot], a = ADV * FS.sz;
+  if (t.k === TK_INT) return numChars(v, 0) * a;
+  if (t.k === TK_FIX) return numChars(v, t.dec) * a;
+  if (t.k === TK_SGN) return (numChars(Math.abs(v), t.dec) + (v < 0 && Math.round(-v * POW10[t.dec]) > 0 ? 1 : 0)) * a;
+  if (v > 0 && v < 1e-3) { sci(v, t.dec); return (numChars(SCI_M, t.dec - 1) + 3) * a + EXPW[-SCI_E] * FS.sz; }
+  return numChars(v, sigDec(v, t.dec)) * a;
+}
+function widthF(Fm, FS) {
+  let w = 0;
+  for (let i = 0; i < Fm.length; i++) {
+    const t = Fm[i];
+    if (t.k === TK_SUP && i > 0 && Fm[i - 1].k === TK_SUB) { const ws = Fm[i - 1].w * FS.sz, wp = t.w * FS.sz; if (wp > ws) w += wp - ws; continue; }
+    w += tokW(t, FS);
+  }
+  return w;
+}
+function drawF(c, Fm, x, y, FS, th) {
+  for (let i = 0; i < Fm.length; i++) {
+    const t = Fm[i]; c.fillStyle = PAL_HEX[th[t.r]];
+    if (t.k <= TK_M) {
+      c.font = t.k === TK_I ? FS.I : t.k === TK_U ? FS.U : t.k === TK_M ? FS.M : FS.S;
+      if (t.k === TK_SUP && i > 0 && Fm[i - 1].k === TK_SUB) {   // superscript stacked over the preceding subscript
+        const ws = Fm[i - 1].w * FS.sz, wp = t.w * FS.sz;
+        c.fillText(t.s, x - ws, y - 0.42 * FS.sz); if (wp > ws) x += wp - ws; continue;
+      }
+      c.fillText(t.s, x, t.k === TK_SUB ? y + 0.3 * FS.sz : t.k === TK_SUP ? y - 0.42 * FS.sz : y);
+      x += t.w * FS.sz; continue;
+    }
+    c.font = FS.N; CUR_FS = FS.sz;
+    const v = LV[t.slot];
+    if (t.k === TK_INT) x = pnum(c, v, 0, x, y);
+    else if (t.k === TK_FIX) x = pnum(c, v, t.dec, x, y);
+    else if (t.k === TK_SGN) {
+      if (v < 0 && Math.round(-v * POW10[t.dec]) > 0) { c.fillText('−', x, y); x += ADV * FS.sz; }
+      x = pnum(c, Math.abs(v), t.dec, x, y);
+    } else if (v > 0 && v < 1e-3) {
+      sci(v, t.dec); x = pnum(c, SCI_M, t.dec - 1, x, y); c.fillText('×10', x, y); x += 3 * ADV * FS.sz;
+      c.font = FS.S; c.fillText(EXPS[-SCI_E], x, y - 0.42 * FS.sz); x += EXPW[-SCI_E] * FS.sz;
+    } else x = pnum(c, v, sigDec(v, t.dec), x, y);
+  }
+  return x;
+}
+function drawFC(c, Fm, cx, y, FS, th) { return drawF(c, Fm, cx - widthF(Fm, FS) / 2, y, FS, th); }   // centred on cx
+function fillLV(sim) {
+  const n = sim.net;
+  LV[V_INK] = sim.inkN; LV[V_A1] = sim.actN1; LV[V_A2] = sim.actN2; LV[V_PRED] = sim.vPred; LV[V_PPRED] = sim.vp[sim.vPred];
+  LV[V_Y] = sim.vLabel; LV[V_PY] = sim.vp[sim.vLabel]; LV[V_L] = sim.vLoss; LV[V_D3Y] = sim.vd3[sim.vLabel];
+  LV[V_D2] = sim.dN2; LV[V_D1] = sim.dN1; LV[V_GXM] = sim.vgxMax;
+  LV[V_DW1] = sim.dWn[0]; LV[V_DW2] = sim.dWn[1]; LV[V_DW3] = sim.dWn[2];
+  LV[V_STEP] = n.steps; LV[V_EPOCH] = n.epoch; LV[V_LOTE] = Math.round(n.ptr / BATCH);
+  LV[V_TRDONE] = sim.trainStart >= 0 ? n.steps - sim.trainStart : 0; LV[V_TRN] = sim.trainTotal;
+}
+function chart(c, H, n, vmax, y0, ci, lw, dotted) {   // one series of a card chart: last 32 validation passes, linear 0…vmax
+  if (n < 2) return;
+  c.beginPath();
+  for (let i = 0; i < n; i++) {
+    let v = H[i] / vmax; v = v < 0 ? 0 : v > 1 ? 1 : v;
+    const x = CH_X + i * CH_W / 31, y = y0 + CH_H - v * CH_H;
+    if (i) c.lineTo(x, y); else c.moveTo(x, y);
+  }
+  c.setLineDash(dotted ? DOTS06 : NODASH); c.strokeStyle = PAL_HEX[ci]; c.lineWidth = lw; c.stroke(); c.setLineDash(NODASH);
+}
+
+let LPX = 0, LPY = 0;
+function lossPt(k, f) {   // point at fraction f of the route output neuron k → along its row → bar end → loss node
+  const yk = NY[48 + k] + 2.5, xn = LX[3] + 2.5 + NR, xb = BAR_X + 20;
+  if (f <= 0.3) { LPX = xn + (f / 0.3) * (xb - xn); LPY = yk; }
+  else { const g = (f - 0.3) / 0.7; LPX = xb + g * (LOSS_X - LOSS_R - xb); LPY = yk + g * (LOSS_Y - yk); }
+}
+function glow(c, ci, x, y, r, a) {
+  if (a <= 0.004) return;
+  c.globalAlpha = a > 1 ? 1 : a; c.drawImage(SPR[ci], x - r, y - r, 2 * r, 2 * r);
+}
+function seg(c, p, f0, f1) {
+  const x0 = PX0[p], y0 = PY0[p], dx = PX1[p] - x0, dy = PY1[p] - y0;
+  c.moveTo(x0 + dx * f0, y0 + dy * f0); c.lineTo(x0 + dx * f1, y0 + dy * f1);
+}
+function roundRect(c, x, y, w, h, r) {
+  c.beginPath(); c.moveTo(x + r, y); c.arcTo(x + w, y, x + w, y + h, r); c.arcTo(x + w, y + h, x, y + h, r);
+  c.arcTo(x, y + h, x, y, r); c.arcTo(x, y, x + w, y, r); c.closePath();
+}
+function ledPath(c, s, dx) {
+  const o = s * 12; c.beginPath(); c.moveTo(LED_X + dx + LEDP[o], LED_Y + LEDP[o + 1]);
+  for (let k = 1; k < 6; k++) c.lineTo(LED_X + dx + LEDP[o + 2 * k], LED_Y + LEDP[o + 2 * k + 1]);
+  c.closePath();
+}
+function ledBevel(c, s, dx) {   // top edge of horizontal segments, left edge of vertical ones
+  const o = s * 12, hz = s === 0 || s === 3 || s === 6;
+  const a = 0, b = hz ? 1 : 5, d = hz ? 2 : 4, e = 3;
+  c.beginPath(); c.moveTo(LED_X + dx + LEDP[o + 2 * a], LED_Y + LEDP[o + 2 * a + 1]);
+  c.lineTo(LED_X + dx + LEDP[o + 2 * b], LED_Y + LEDP[o + 2 * b + 1]);
+  c.lineTo(LED_X + dx + LEDP[o + 2 * d], LED_Y + LEDP[o + 2 * d + 1]);
+  c.lineTo(LED_X + dx + LEDP[o + 2 * e], LED_Y + LEDP[o + 2 * e + 1]);
+}
+function scanSmooth(tt) {
+  const W = SCAN_X1 - SCAN_X0;
+  return tt < 60 ? SCAN_X0 + Math.min(1, tt / 57) * W : SCAN_X1 - Math.min(1, (tt - 60) / 57) * W;
+}
+// x of the active front. BACKWARD: loss node → outputs → H2 → H1 → input → wires → painting sweep across the image
+function frontSmooth(st, tt, p0) {
+  if (st === ST_FORWARD) {
+    let L = ((tt - 4) / 36) | 0; if (L < 0) L = 0; if (L > 2) L = 2;
+    let f = (tt - (4 + L * 36)) / 30; f = f < 0 ? 0 : f > 1 ? 1 : f;
+    return LX[L] + 5 + f * (LX[L + 1] - LX[L] - 6);
+  }
+  if (st === ST_BACKWARD) {
+    if (tt < BT0) { const a = LOSS_X - LOSS_R, b = LX[3] + 5; return a - (tt / BT0) * (a - b); }
+    const tb = tt - BT0;
+    if (tb < 3 * BSP) {
+      const ph = (tb / BSP) | 0, L = 2 - ph; let f = (tb - ph * BSP) / (BSP - 1); if (f > 1) f = 1;
+      return LX[L + 1] - 1 - f * (LX[L + 1] - LX[L] - 6);
+    }
+    const w0 = BT0 + 3 * BSP;
+    if (tt < p0) { let f = (tt - w0) / Math.max(1, p0 - w0); f = f < 0 ? 0 : f > 1 ? 1 : f; return LX[0] + 4 - f * (LX[0] + 4 - (DIG_X + 28)); }
+    let f = (tt - p0) / PAINT_D; f = f > 1 ? 1 : f;
+    return DIG_X + 28 - f * 28;
+  }
+  if (st === ST_SOLVED && tt < 120) return scanSmooth(tt);
+  return -1000;
+}
+function diamondPath(c, r) {
+  c.beginPath(); c.moveTo(LOSS_X, LOSS_Y - r); c.lineTo(LOSS_X + r, LOSS_Y); c.lineTo(LOSS_X, LOSS_Y + r); c.lineTo(LOSS_X - r, LOSS_Y); c.closePath();
+}
+
+function meshWidth(wl) { return 0.07 + 0.2 * (wl + 0.5) / NWL; }   // logical units: 0.087 (weakest) … 0.253 (strongest)
+function renderStatic(sim) {
+  if (!STATIC || STATIC.width !== VW || STATIC.height !== VH) STATIC = MAKE_CANVAS(VW, VH);
+  const c = STATIC.getContext('2d');
+  c.setTransform(1, 0, 0, 1, 0, 0); c.globalAlpha = 1; c.globalCompositeOperation = 'source-over';
+  c.fillStyle = '#000'; c.fillRect(0, 0, VW, VH);
+  c.setTransform(K, 0, 0, K, OX, OY);
+  c.lineCap = 'round'; c.lineJoin = 'round'; c.textBaseline = 'alphabetic';
+  // dot-matrix texture between the layers
+  c.fillStyle = PAL_HEX[1]; c.beginPath();
+  for (let y = DOT_Y0; y <= DOT_Y1; y += 3) for (let x = DOT_X0; x <= DOT_X1; x += 3) {
+    if (DOTSKIP[x]) continue; c.moveTo(x + 0.8, y + 0.5); c.arc(x + 0.5, y + 0.5, 0.3, 0, TAU);
+  }
+  c.fill();
+  // dormant mesh: top-5 |w| incoming edges per neuron; thickness ∝ |w| (6 levels), brighter = ≥ 60% of the layer's
+  // strongest drawn edge, dashed = negative weight
+  for (let pass = 0; pass < 4 * NWL; pass++) {
+    const wl = pass >> 2, bright = (pass >> 1) & 1, neg = pass & 1;
+    let any = false;
+    c.setLineDash(neg ? DASH : NODASH); c.strokeStyle = PAL_HEX[bright ? 23 : 2]; c.lineWidth = meshWidth(wl); c.beginPath();
+    for (let e = 0; e < NE; e++) if (sim.eWL[e] === wl && (sim.eRest[e] === 23 ? 1 : 0) === bright && sim.eNeg[e] === neg) { seg(c, sim.eP[e], 0, 1); any = true; }
+    if (any) c.stroke();
+  }
+  c.setLineDash(NODASH);
+  // panels
+  c.strokeStyle = PAL_HEX[19]; c.lineWidth = 0.3;
+  roundRect(c, PANEL_X + 0.5, PANEL_Y + 0.5, 39, 39, 1.4); c.stroke();
+  roundRect(c, PRED_X + 0.5, PRED_Y + 0.5, PRED_W - 1, PRED_H - 1, 1.4); c.stroke();
+  // wires: each drawn input neuron reads exactly one pixel of the image
+  c.strokeStyle = PAL_HEX[2]; c.lineWidth = 0.14; c.beginPath();
+  for (let i = 0; i < 16; i++) {
+    const pix = SAMPLE_PIX[i];
+    c.moveTo(DIG_X + pix % 28 + 0.5, DIG_Y + ((pix / 28) | 0) + 0.5); c.lineTo(LX[0] + 2.5 - NR, NY[i] + 2.5);
+  }
+  c.stroke();
+  // the ten probabilities feed the loss node
+  c.strokeStyle = PAL_HEX[23]; c.lineWidth = 0.4; c.setLineDash(DOTS); c.beginPath();
+  for (let k = 0; k < 10; k++) { c.moveTo(BAR_X + 20, NY[48 + k] + 2.5); c.lineTo(LOSS_X - LOSS_R, LOSS_Y); }
+  c.stroke(); c.setLineDash(NODASH);
+  diamondPath(c, LOSS_R); c.fillStyle = '#000'; c.fill(); c.strokeStyle = PAL_HEX[3]; c.lineWidth = 0.35; c.stroke();
+  // "⋮" in the input layer gap
+  c.fillStyle = PAL_HEX[19]; c.beginPath();
+  for (let k = 0; k < 3; k++) { c.moveTo(LX[0] + 2.85, 65.5 + 3 * k); c.arc(LX[0] + 2.5, 65.5 + 3 * k, 0.35, 0, TAU); }
+  c.fill();
+  // dotted probability tracks
+  c.strokeStyle = PAL_HEX[23]; c.lineWidth = 0.5; c.setLineDash(DOTS); c.beginPath();
+  for (let k = 0; k < 10; k++) { const y = NY[48 + k] + 2.5; c.moveTo(BAR_X, y); c.lineTo(BAR_X + 20, y); }
+  c.stroke(); c.setLineDash(NODASH);
+  // key for the neuron levels: blue = activation a, magenta = δ; same three levels in every layer
+  const key = function (x, y, lv, md) {
+    c.fillStyle = '#000'; c.beginPath(); c.arc(x, y, 1.5, 0, TAU); c.fill();
+    c.strokeStyle = PAL_HEX[lv === 0 ? 3 : lv === 1 ? (md ? 11 : 5) : (md ? 13 : 7)]; c.lineWidth = lv === 2 ? 0.34 : 0.26;
+    c.beginPath(); c.arc(x, y, 1.5, 0, TAU); c.stroke();
+    if (lv === 1) { c.fillStyle = PAL_HEX[md ? 12 : 6]; c.beginPath(); c.arc(x, y, 0.55, 0, TAU); c.fill(); }
+    if (lv === 2) { c.fillStyle = PAL_HEX[md ? 14 : 8]; c.beginPath(); c.arc(x, y, 0.95, 0, TAU); c.fill(); c.fillStyle = '#fff'; c.beginPath(); c.arc(x, y, 0.5, 0, TAU); c.fill(); }
+  };
+  // neuron key as a small table: rows a (activation, blue) and δ (error, magenta); columns = the three drawn levels,
+  // relative to the strongest neuron of the same layer
+  setFont(c, F_KEYT, FS_KEYT); text(c, 'NEURONAS', 4, 14.6, 19);
+  setFont(c, F_TINY, FS_TINY);
+  text(c, '0', 13.5 - textW(1) / 2, 18.7, 20); text(c, '<55%', 21.5 - textW(4) / 2, 18.7, 20); text(c, '≥55%', 29.5 - textW(4) / 2, 18.7, 20);
+  for (let lv = 0; lv < 3; lv++) { key(13.5 + 8 * lv, 22.5, lv, 0); key(13.5 + 8 * lv, 27.5, lv, 1); }
+  drawF(c, FK_A, 5.4, 23.7, FSK, TH_KA); drawF(c, FK_D, 5.4, 28.7, FSK, TH_KD);
+  setFont(c, F_TINY, FS_TINY);
+  text(c, '% DEL MÁX. DE SU CAPA', 4, 33.5, 20);
+  text(c, 'SALIDA: P ≥ 0.1', 4, 37.4, 20);
+  // labels and legend
+  setFont(c, F_LBL, FS_LBL);
+  text(c, 'ENTRADA', 4, 45.6, 19); drawF(c, FK_X, 4 + textW(8), 45.6, FSK, TH_LBL);
+  setFont(c, F_LBL, FS_LBL);
+  text(c, 'PREDICCIÓN', PRED_X + PRED_W / 2 - textW(10) / 2, PRED_Y - 2.6, 19);
+  text(c, 'PÉRDIDA', LOSS_X + LOSS_R + 2.2, LOSS_Y + 1.6, 19);
+  setFont(c, F_LEG, FS_LEG);
+  text(c, 'W:', 4, 107.1, 19);
+  c.strokeStyle = PAL_HEX[6]; c.lineWidth = 0.4; c.beginPath(); c.moveTo(10.5, 105.7); c.lineTo(16.5, 105.7); c.stroke();
+  text(c, '+', 18, 107.1, 19);
+  c.setLineDash(DASH); c.beginPath(); c.moveTo(24.5, 105.7); c.lineTo(30.5, 105.7); c.stroke(); c.setLineDash(NODASH);
+  text(c, '−', 32, 107.1, 19);
+  text(c, 'GROSOR ∝ |W|', 4, 111.8, 19);
+  setFont(c, F_FOOT, FS_FOOT);
+  text(c, '5 |W| MAYORES', 4, 126.3, 20); text(c, 'POR NEURONA', 4, 129.8, 20);
+}
+
+function render(c, sim, alpha) {
+  if (STATIC_KEY !== sim.topkVer || !STATIC || STATIC.width !== VW || STATIC.height !== VH) { renderStatic(sim); STATIC_KEY = sim.topkVer; }
+  const st = sim.state, net = sim.net;
+  let tt = sim.t + alpha; if (tt > DUR[st] - 0.001) tt = DUR[st] - 0.001;
+  c.setTransform(1, 0, 0, 1, 0, 0); c.globalAlpha = 1; c.globalCompositeOperation = 'source-over'; c.shadowBlur = 0;
+  if (sim.shx || sim.shy) { c.fillStyle = '#000'; c.fillRect(0, 0, VW, VH); }
+  c.drawImage(STATIC, sim.shx * K, sim.shy * K);
+  c.setTransform(K, 0, 0, K, OX + sim.shx * K, OY + sim.shy * K);
+  c.lineCap = 'round'; c.lineJoin = 'round'; c.textBaseline = 'alphabetic';
+
+  // ---- dot texture brightens in a soft vertical wave that follows the active front
+  const xf = frontSmooth(st, tt, sim.paintT0);
+  if (xf > -1000) {
+    const mag = st === ST_BACKWARD || (st === ST_SOLVED && tt >= 60);
+    for (let y = DOT_Y0; y <= DOT_Y1; y += 3) {
+      const wob = 2 * Math.sin(y * 0.13 + tt * 0.12);
+      for (let x = DOT_X0; x <= DOT_X1; x += 3) {
+        if (DOTSKIP[x]) continue;
+        const d = Math.abs(x - xf - wob); if (d > 6) continue;
+        c.globalAlpha = 1 - d / 6; c.fillStyle = PAL_HEX[d < 2 ? (mag ? 10 : 4) : (mag ? 22 : 21)];
+        c.beginPath(); c.arc(x + 0.5, y + 0.5, 0.36, 0, TAU); c.fill();
+      }
+    }
+    c.globalAlpha = 1;
+  }
+
+  // ---- active connections
+  if (st === ST_FORWARD || st === ST_BACKWARD) {
+    const fwd = st === ST_FORWARD, R = fwd ? FR : BR, I_ = fwd ? sim.eFI : sim.eBI, T_ = fwd ? sim.eFT : sim.eBT;
+    const NG = fwd ? sim.eNeg : sim.eBNeg;   // dashed = negative contribution w·a (forward) / negative dW (backward)
+    const TV = fwd ? TRAVEL : TRAVEL_B;
+    for (let e = 0; e < NE; e++) {
+      const I = I_[e]; if (I === 0) continue;
+      const dt = tt - T_[e]; if (dt < 0) continue;
+      const p = sim.eP[e], tr = 1 + Math.round(I * 2), ia = 0.3 + 0.7 * Math.sqrt(I);   // opacity ∝ √intensity
+      c.setLineDash(NG[e] ? DASH : NODASH);
+      if (dt < TV) {
+        const f = dt / TV, h = fwd ? f : 1 - f, o = fwd ? 0 : 1, tl = fwd ? Math.max(0, f - 0.16) : Math.min(1, h + 0.16);
+        c.globalAlpha = 0.9 * ia; c.strokeStyle = PAL_HEX[R[tr]]; c.lineWidth = 0.22; c.beginPath(); seg(c, p, o, h); c.stroke();
+        c.globalAlpha = ia; c.strokeStyle = PAL_HEX[R[tr + 1]]; c.lineWidth = 0.42; c.beginPath(); seg(c, p, tl, h); c.stroke();
+      } else {
+        const a = 1 - (dt - TV) / 16; if (a <= 0) continue;
+        c.globalAlpha = a * 0.9 * ia; c.strokeStyle = PAL_HEX[R[tr]]; c.lineWidth = 0.22; c.beginPath(); seg(c, p, 0, 1); c.stroke();
+      }
+    }
+    c.setLineDash(NODASH);
+    c.globalCompositeOperation = 'lighter';
+    for (let e = 0; e < NE; e++) {
+      const I = I_[e]; if (I === 0) continue;
+      const dt = tt - T_[e]; if (dt < 0 || dt >= TV) continue;
+      const p = sim.eP[e], f = dt / TV, h = fwd ? f : 1 - f, tr = 1 + Math.round(I * 2);
+      const hx = PX0[p] + (PX1[p] - PX0[p]) * h, hy = PY0[p] + (PY1[p] - PY0[p]) * h;
+      glow(c, R[tr + 2 > 5 ? 5 : tr + 2], hx, hy, 1.4 + 1.8 * I, 0.45 + 0.55 * I);
+      glow(c, 9, hx, hy, 0.7, 0.2 + 0.8 * I);
+    }
+    c.globalCompositeOperation = 'source-over'; c.globalAlpha = 1;
+  } else if (st === ST_UPDATE && tt < 30) {          // flash ∝ applied |Δw| of the batch update
+    for (let e = 0; e < NE; e++) {
+      const fl = sim.eFl[e], a = fl * (1 - tt / 30); if (a < 0.03) continue;
+      c.setLineDash(sim.eUNeg[e] ? DASH : NODASH);
+      c.globalAlpha = a; c.strokeStyle = PAL_HEX[FR[2 + Math.round(fl * 3)]]; c.lineWidth = 0.18 + 0.34 * fl;
+      c.beginPath(); seg(c, sim.eP[e], 0, 1); c.stroke();
+    }
+    c.setLineDash(NODASH); c.globalAlpha = 1;
+  } else if (st === ST_SOLVED && tt < 120) {          // full sweep: blue left→right, magenta right→left
+    const blue = tt < 60, R = blue ? FR : BR;
+    for (let band = 2; band >= 0; band--) {
+      const w = band === 0 ? 2 : band === 1 ? 6 : 14;
+      c.save(); c.beginPath(); c.rect(blue ? xf - w : xf, 0, w, LH); c.clip();
+      c.globalAlpha = band === 2 ? 0.7 : 1; c.strokeStyle = PAL_HEX[R[band === 0 ? 5 : band === 1 ? 4 : 2]]; c.lineWidth = 0.28;
+      c.beginPath(); for (let e = 0; e < NE; e++) seg(c, sim.eP[e], 0, 1); c.stroke();
+      c.restore();
+    }
+    c.globalCompositeOperation = 'lighter'; c.fillStyle = PAL_HEX[blue ? 8 : 14];
+    c.globalAlpha = 0.85; c.fillRect(xf - 0.15, 9, 0.3, 120); c.globalAlpha = 0.14; c.fillRect(xf - 1.6, 9, 3.2, 120);
+    c.globalCompositeOperation = 'source-over'; c.globalAlpha = 1;
+  }
+
+  // ---- loss node L = −ln p_y. LOSS: only p_y flows in (the one-hot target zeroes every other term), from its output
+  //      neuron along its row into L. BACKWARD: ∂L/∂z_k = p_k − y_k flows from L back to every output neuron
+  //      (dashed = negative, i.e. the true class); each output shows its δ exactly when its pulse reaches it.
+  {
+    const k1 = 1 - Math.exp(-sim.vLoss);          // = 1 − p_y: 0 when p_y = 1, grows with L, never saturates abruptly
+    const xd = LOSS_X - LOSS_R, xb = BAR_X + 20;
+    if (st === ST_LOSS) {
+      const k = sim.vLabel, yk = NY[48 + k] + 2.5, f = Math.min(1, tt / TL_LOSS);
+      lossPt(k, f);
+      if (f > 0.3) {
+        c.globalAlpha = tt < TL_LOSS ? 1 : Math.max(0.35, 1 - (tt - TL_LOSS) / 25);
+        c.strokeStyle = PAL_HEX[tt < TL_LOSS ? 9 : 14]; c.lineWidth = 0.32;
+        c.beginPath(); c.moveTo(xb, yk); c.lineTo(LPX, LPY); c.stroke(); c.globalAlpha = 1;
+      }
+      if (tt < TL_LOSS) { c.globalCompositeOperation = 'lighter'; glow(c, 9, LPX, LPY, 1.6, 1); c.globalCompositeOperation = 'source-over'; c.globalAlpha = 1; }
+    } else if (st === ST_BACKWARD && tt < BT0 + 16) {
+      let m = 0; for (let k = 0; k < 10; k++) if (Math.abs(sim.vd3[k]) > m) m = Math.abs(sim.vd3[k]);
+      for (let k = 0; k < 10; k++) {
+        const I = m > 0 ? Math.abs(sim.vd3[k]) / m : 0; if (I === 0) continue;
+        const dt = tt - LOSS_ST[k]; if (dt < 0) continue;
+        const yk = NY[48 + k] + 2.5, ia = 0.3 + 0.7 * Math.sqrt(I), tr = 1 + Math.round(I * 2);
+        c.setLineDash(sim.vd3[k] < 0 ? DASH : NODASH); c.strokeStyle = PAL_HEX[BR[tr]]; c.lineWidth = 0.26;
+        if (dt < TL_LOSS) {
+          const f = 1 - dt / TL_LOSS; lossPt(k, f);
+          c.globalAlpha = 0.9 * ia; c.beginPath(); c.moveTo(xd, LOSS_Y);
+          if (f > 0.3) c.lineTo(LPX, LPY); else c.lineTo(xb, yk);
+          c.stroke();
+          c.setLineDash(NODASH); c.globalCompositeOperation = 'lighter';
+          glow(c, BR[tr + 2 > 5 ? 5 : tr + 2], LPX, LPY, 1.3 + 1.6 * I, 0.5 + 0.5 * I);
+          c.globalCompositeOperation = 'source-over';
+        } else {
+          const a = 1 - (dt - TL_LOSS) / 16;
+          if (a > 0) { c.globalAlpha = a * 0.9 * ia; c.beginPath(); c.moveTo(xd, LOSS_Y); c.lineTo(xb, yk); c.stroke(); }
+        }
+      }
+      c.setLineDash(NODASH); c.globalAlpha = 1;
+    }
+    let dl = 0, dci = 3;
+    if (st === ST_LOSS && tt >= TL_LOSS) { const l = sim.vLoss, s0 = l > 1.5 ? 0 : l > 0.7 ? 1 : l > 0.3 ? 2 : 3; let i = s0 + (((tt - TL_LOSS) / 5) | 0); if (i > 4) i = 4; dci = BRK[i]; dl = 1; }
+    else if (st === ST_BACKWARD) { dci = 13; dl = tt < BT0 ? 1 : Math.max(0.3, 1 - (tt - BT0) / 20); }
+    else if (st === ST_UPDATE || st === ST_TRAIN) { dci = 11; dl = 0.3; }
+    if (dl > 0) {
+      diamondPath(c, LOSS_R); c.globalAlpha = dl; c.fillStyle = PAL_HEX[dci]; c.fill(); c.globalAlpha = 1;
+      c.globalCompositeOperation = 'lighter';
+      glow(c, dci, LOSS_X, LOSS_Y, 4 + 7 * k1, dl * (0.35 + 0.65 * k1));
+      c.globalCompositeOperation = 'source-over'; c.globalAlpha = 1;
+    }
+    setFont(c, F_LBL, FS_LBL); text(c, 'L', LOSS_X - textW(1) / 2, LOSS_Y + 1.65, dl > 0.5 ? 0 : 19);
+  }
+
+  // ---- neurons: off = ring, medium = ring + core, high = bright core + glow + plus-shaped sparkle
+  const winN = 48 + sim.vPred;
+  for (let n = 0; n < NNEU; n++) {
+    let lv = 0, mode = 0;
+    switch (st) {
+      case ST_INPUT: if (n < 16 && tt >= 20) lv = sim.fwdLv[n]; break;
+      case ST_FORWARD: lv = (n < 16 || tt >= sim.nFwdT[n]) ? sim.fwdLv[n] : 0; break;
+      case ST_SOFTMAX: lv = sim.fwdLv[n]; if (n === winN && tt >= 10) lv = 2; break;
+      case ST_LOSS: lv = sim.fwdLv[n]; if (n === winN) lv = 2; break;
+      case ST_BACKWARD:
+        if (tt >= sim.nBwdT[n]) { lv = sim.bwdLv[n]; mode = 1; } else { lv = sim.fwdLv[n]; if (n === winN) lv = 2; }
+        break;
+      case ST_UPDATE: mode = 1; lv = sim.bwdLv[n] - ((tt / 10) | 0); if (lv < 0) lv = 0; break;
+      case ST_SOLVED:
+        if (tt < 120) { const d = Math.abs(NX[n] + 2.5 - xf); mode = tt < 60 ? 0 : 1; lv = d <= 4 ? 2 : d <= 9 ? 1 : 0; }
+        else { lv = sim.fwdLv[n]; if (n === winN) lv = 2; }
+        break;
+    }
+    NLV[n] = lv; NMD[n] = mode;
+  }
+  const breath = st === ST_IDLE ? 0.35 + 0.65 * Math.sin(PI * tt / DUR[ST_IDLE]) : 0;
+  for (let n = 0; n < NNEU; n++) {
+    const cx = NX[n] + 2.5, cy = NY[n] + 2.5, lv = NLV[n], md = NMD[n];
+    c.fillStyle = '#000'; c.beginPath(); c.arc(cx, cy, NR, 0, TAU); c.fill();
+    let rc = 3, lw = 0.32;
+    if (lv === 1) rc = md ? 11 : 5; else if (lv === 2) { rc = md ? 13 : 7; lw = 0.42; }
+    c.strokeStyle = PAL_HEX[rc]; c.lineWidth = lw; c.beginPath(); c.arc(cx, cy, NR, 0, TAU); c.stroke();
+    if (lv === 0 && breath > 0) { c.globalAlpha = breath; c.strokeStyle = PAL_HEX[24]; c.stroke(); c.globalAlpha = 1; }
+    if (lv === 1) { c.fillStyle = PAL_HEX[md ? 12 : 6]; c.beginPath(); c.arc(cx, cy, 0.75, 0, TAU); c.fill(); }
+    else if (lv === 2) {
+      c.fillStyle = PAL_HEX[md ? 14 : 8]; c.beginPath(); c.arc(cx, cy, 1.35, 0, TAU); c.fill();
+      c.fillStyle = '#fff'; c.beginPath(); c.arc(cx, cy, 0.72, 0, TAU); c.fill();
+    }
+  }
+  c.globalCompositeOperation = 'lighter';
+  for (let n = 0; n < NNEU; n++) {
+    const lv = NLV[n]; if (!lv) continue;
+    const cx = NX[n] + 2.5, cy = NY[n] + 2.5, md = NMD[n];
+    if (lv === 1) { glow(c, md ? 12 : 6, cx, cy, 3.2, 0.4); continue; }
+    glow(c, md ? 13 : 7, cx, cy, 6, 0.75);
+    const arm = 2 + 0.45 * Math.sin(tt * 0.3 + n);
+    c.globalAlpha = 0.95; c.strokeStyle = PAL_HEX[md ? 14 : 8]; c.lineWidth = 0.24; c.beginPath();
+    c.moveTo(cx, cy - NR - 0.3); c.lineTo(cx, cy - NR - 0.3 - arm); c.moveTo(cx, cy + NR + 0.3); c.lineTo(cx, cy + NR + 0.3 + arm);
+    c.moveTo(cx - NR - 0.3, cy); c.lineTo(cx - NR - 0.3 - arm, cy); c.moveTo(cx + NR + 0.3, cy); c.lineTo(cx + NR + 0.3 + arm, cy);
+    c.stroke();
+  }
+  c.globalCompositeOperation = 'source-over'; c.globalAlpha = 1;
+
+  // ---- output labels + probability bars
+  let showWin = false, barProg = 0;
+  if (st === ST_SOFTMAX) { let f = tt / 20; if (f > 1) f = 1; barProg = 1 - (1 - f) * (1 - f) * (1 - f); showWin = tt >= 10; }
+  else if (st === ST_LOSS || st === ST_BACKWARD || st === ST_UPDATE || st === ST_TRAIN) { barProg = 1; showWin = true; }
+  else if (st === ST_IDLE) { let f = tt / 20; if (f > 1) f = 1; barProg = 1 - f; }
+  else if (st === ST_SOLVED && tt >= 120) { barProg = 1; showWin = true; }
+  let brk = -1;
+  if (st === ST_LOSS) {
+    const l = sim.vLoss, s0 = l > 1.5 ? 0 : l > 0.7 ? 1 : l > 0.3 ? 2 : 3;
+    let i = s0 + ((tt / 5) | 0); if (i > 4) i = 4; brk = BRK[i];
+  } else if (st === ST_BACKWARD) brk = 11;
+  setFont(c, F_OUT, FS_OUT);
+  c.lineCap = 'butt';
+  for (let k = 0; k < 10; k++) {
+    const y = NY[48 + k], win = showWin && k === sim.vPred;
+    let lc = win ? 9 : 18; if (brk >= 0 && k === sim.vLabel) lc = brk;
+    text(c, DIG[k], LABEL_X, y + 4.6, lc);
+    const len = sim.vp[k] * 20 * barProg;
+    if (len > 0.05) {
+      c.strokeStyle = PAL_HEX[win ? 7 : 5]; c.lineWidth = win ? 1.15 : 0.55;
+      c.beginPath(); c.moveTo(BAR_X, y + 2.5); c.lineTo(BAR_X + len, y + 2.5); c.stroke();
+      if (win) {
+        c.globalCompositeOperation = 'lighter'; c.globalAlpha = 0.28; c.lineWidth = 2.8; c.stroke();
+        c.globalCompositeOperation = 'source-over'; c.globalAlpha = 1;
+      }
+    }
+  }
+  if (brk >= 0) {     // bracket around the true label's output neuron
+    const x = LX[3], y = NY[48 + sim.vLabel];
+    c.strokeStyle = PAL_HEX[brk]; c.lineWidth = 0.34; c.beginPath();
+    c.moveTo(x - 0.1, y - 0.7); c.lineTo(x - 0.9, y - 0.7); c.lineTo(x - 0.9, y + 5.7); c.lineTo(x - 0.1, y + 5.7);
+    c.moveTo(x + 5.1, y - 0.7); c.lineTo(x + 5.9, y - 0.7); c.lineTo(x + 5.9, y + 5.7); c.lineTo(x + 5.1, y + 5.7);
+    c.stroke();
+    if (st === ST_LOSS) {   // white → magenta flash, strength ∝ this sample's cross-entropy
+      c.globalCompositeOperation = 'lighter';
+      const k1b = 1 - Math.exp(-sim.vLoss);   // = 1 − p_y
+      glow(c, brk, x + 2.5, y + 2.5, 7 + 5 * k1b, (1 - tt / DUR[ST_LOSS]) * (0.35 + 0.65 * k1b));
+      c.globalCompositeOperation = 'source-over'; c.globalAlpha = 1;
+    }
+  }
+  c.lineCap = 'round';
+
+  // ---- input digit: the real 28×28 values (smoothly upscaled)
+  let penX = -1, penY = -1, paintOn = false, brushX = -1, wmax = 0;
+  for (let i = 0; i < 16; i++) if (Math.abs(sim.vd0[i]) > wmax) wmax = Math.abs(sim.vd0[i]);
+  if (sim.dispX) {
+    const X = sim.dispX, O = sim.dispO, off = sim.dispOff;
+    let fade = 1, thr = 255, dis = -1;
+    if (st === ST_IDLE) dis = tt / 18;                                   // pixels dissolve in a fixed random order
+    else if (st === ST_SOLVED && tt < 120) fade = 1 - Math.min(1, tt / 20);
+    else if (st === ST_INPUT && tt < 10) thr = tt / 10 * 254;            // written in real stroke order
+    if (fade > 0) {
+      if (!DIGC) { DIGC = MAKE_CANVAS(28, 28); DIGX = DIGC.getContext('2d'); DIGI = DIGX.createImageData(28, 28); }
+      const px = DIGI.data;
+      let sx = 0, sy = 0, sw = 0;
+      for (let i = 0; i < 784; i++) {
+        let a = X[off + i] * fade;
+        if (dis >= 0 && RANK[i] < dis) a = 0;
+        if (thr < 255) {
+          const o = O[off + i];
+          if (o === 255 || o > thr) a = 0;
+          else { a *= Math.min(1, (thr - o) / 12 + 0.25); if (o > thr - 10) { const w = X[off + i]; sx += (i % 28 + 0.5) * w; sy += (((i / 28) | 0) + 0.5) * w; sw += w; } }
+        }
+        const g = (a * 255) | 0; px[4 * i] = g; px[4 * i + 1] = g; px[4 * i + 2] = g; px[4 * i + 3] = 255;
+      }
+      if (sw > 0) { penX = DIG_X + sx / sw; penY = DIG_Y + sy / sw; }
+      DIGX.putImageData(DIGI, 0, 0);
+      c.imageSmoothingEnabled = true; c.imageSmoothingQuality = 'high';
+      c.globalCompositeOperation = 'lighter';
+      c.drawImage(DIGC, DIG_X, DIG_Y, 28, 28);
+      c.globalCompositeOperation = 'source-over';
+    }
+    // painting: each pixel's contribution x·∂L/∂x (pink = this ink raises L, blue = it lowers L; opacity ∝ |value| /
+    // max of this image), swept in from the right once the backward pass has reached the input; it stays until the
+    // next digit and dissolves with it. (Plain ∂L/∂x is mostly noise on the background: those weights never train.)
+    if (sim.paintValid && sim.vgxMax > 0 && (st === ST_BACKWARD || st === ST_UPDATE || st === ST_TRAIN || st === ST_IDLE)) {
+      let xc = -1;
+      if (st === ST_BACKWARD) { if (tt < sim.paintT0) xc = 99; else { xc = 28 - Math.min(1, (tt - sim.paintT0) / PAINT_D) * 28; if (xc > 0) brushX = DIG_X + xc; } }
+      if (xc < 28) {
+        if (!PNTC) { PNTC = MAKE_CANVAS(28, 28); PNTX = PNTC.getContext('2d'); PNTI = PNTX.createImageData(28, 28); }
+        const q = PNTI.data, inv = 1 / sim.vgxMax;
+        for (let i = 0; i < 784; i++) {
+          const v = sim.vgx[i]; let a = Math.abs(v) * inv;
+          if (xc >= 0) { let rv = (i % 28 + 1 - xc) / 2.5; rv = rv < 0 ? 0 : rv > 1 ? 1 : rv; a *= rv; }
+          if (dis >= 0 && RANK[i] < dis) a = 0;
+          if (v > 0) { q[4 * i] = 255; q[4 * i + 1] = 64; q[4 * i + 2] = 180; } else { q[4 * i] = 69; q[4 * i + 1] = 180; q[4 * i + 2] = 255; }
+          q[4 * i + 3] = (a * 240) | 0;
+        }
+        PNTX.putImageData(PNTI, 0, 0);
+        c.imageSmoothingEnabled = true; c.imageSmoothingQuality = 'high';
+        c.drawImage(PNTC, DIG_X, DIG_Y, 28, 28);
+        paintOn = true;
+      }
+    }
+    // wires pixel ↔ input neuron: blue = the pixel value going in, magenta = ∂L/∂x_i coming back
+    for (let i = 0; i < 16; i++) {
+      const pix = SAMPLE_PIX[i], px0 = DIG_X + pix % 28 + 0.5, py0 = DIG_Y + ((pix / 28) | 0) + 0.5, px1 = LX[0] + 2.5 - NR, py1 = NY[i] + 2.5;
+      if (st === ST_INPUT || st === ST_FORWARD) {
+        const v = sim.vIn[i]; if (v === 0) continue;
+        let a, f = 1;
+        if (st === ST_INPUT) { if (tt < 12) continue; f = Math.min(1, (tt - 12) / 8); a = 0.9 * v; }
+        else a = 0.6 * v * (1 - Math.min(1, tt / 40));
+        if (a <= 0.01) continue;
+        c.globalAlpha = a; c.strokeStyle = PAL_HEX[v >= 0.6 ? 7 : 6]; c.lineWidth = 0.22;
+        c.beginPath(); c.moveTo(px0, py0); c.lineTo(px0 + (px1 - px0) * f, py0 + (py1 - py0) * f); c.stroke();
+      } else if (st === ST_BACKWARD && wmax > 0) {
+        const I = Math.abs(sim.vd0[i]) / wmax; if (I === 0) continue;
+        const dt = tt - sim.nBwdT[i]; if (dt < 0) continue;
+        const ia = 0.3 + 0.7 * Math.sqrt(I), tr = 1 + Math.round(I * 2), f = Math.min(1, dt / TW);
+        c.setLineDash(sim.vd0[i] < 0 ? DASH : NODASH);
+        c.globalAlpha = (dt < TW ? 0.95 : Math.max(0.35, 1 - (dt - TW) / 20)) * ia; c.strokeStyle = PAL_HEX[BR[tr]]; c.lineWidth = 0.24;
+        c.beginPath(); c.moveTo(px1, py1); c.lineTo(px1 + (px0 - px1) * f, py1 + (py0 - py1) * f); c.stroke();
+        c.setLineDash(NODASH);
+        if (dt < TW) { c.globalCompositeOperation = 'lighter'; glow(c, BR[tr + 2 > 5 ? 5 : tr + 2], px1 + (px0 - px1) * f, py1 + (py0 - py1) * f, 1.2 + 1.4 * I, 0.5 + 0.5 * I); c.globalCompositeOperation = 'source-over'; }
+      }
+    }
+    c.globalAlpha = 1;
+    // the 16 pixels read by the drawn input neurons
+    const hl = st === ST_INPUT && tt >= 10 && tt < 15;
+    if (st === ST_BACKWARD && wmax > 0) {
+      for (let i = 0; i < 16; i++) {
+        const pix = SAMPLE_PIX[i], arrived = tt >= sim.nBwdT[i] + TW;
+        c.lineWidth = arrived ? 0.2 : 0.12; c.strokeStyle = PAL_HEX[arrived ? 13 : 5];
+        c.globalAlpha = arrived ? 0.35 + 0.65 * Math.abs(sim.vd0[i]) / wmax : 0.6;
+        c.strokeRect(DIG_X + pix % 28 + 0.03, DIG_Y + ((pix / 28) | 0) + 0.03, 0.94, 0.94);
+      }
+    } else {
+      const oa = dis >= 0 ? 0.6 * (1 - Math.min(1, dis)) : 0.6 * fade;
+      c.lineWidth = hl ? 0.22 : 0.12; c.strokeStyle = PAL_HEX[hl ? 8 : 5]; c.globalAlpha = hl ? 1 : oa;
+      c.beginPath();
+      for (let i = 0; i < 16; i++) { const pix = SAMPLE_PIX[i]; c.rect(DIG_X + pix % 28 + 0.03, DIG_Y + ((pix / 28) | 0) + 0.03, 0.94, 0.94); }
+      c.stroke();
+    }
+    c.globalAlpha = 1;
+    c.globalCompositeOperation = 'lighter';
+    if (penX >= 0) { glow(c, 8, penX, penY, 3.2, 0.9); glow(c, 9, penX, penY, 1.1, 1); }       // the pen tip writing the digit
+    if (brushX >= 0) {                                                                          // the brush painting ∂L/∂x
+      c.globalAlpha = 0.5; c.fillStyle = PAL_HEX[14]; c.fillRect(brushX - 0.15, DIG_Y - 0.5, 0.3, 29);
+      c.globalAlpha = 0.12; c.fillRect(brushX - 1.4, DIG_Y - 0.5, 2.8, 29);
+    }
+    c.globalCompositeOperation = 'source-over'; c.globalAlpha = 1;
+  }
+
+  // ---- prediction: 7-segment LED, segments light one by one; magenta glitch if wrong
+  let rev = -1, glitch = false;
+  if (st === ST_SOFTMAX) { rev = (tt - 8) / 3; glitch = !sim.vCorrect && tt >= 24 && tt < 26; }
+  else if (st === ST_LOSS || st === ST_BACKWARD || st === ST_UPDATE || st === ST_TRAIN || (st === ST_SOLVED && tt >= 120)) rev = 99;
+  {
+    const d = sim.vPred;
+    c.fillStyle = PAL_HEX[2]; c.globalAlpha = 0.55;
+    for (let s = 0; s < 7; s++) {
+      const o = LEDO[d * 7 + s]; if (rev >= 0 && o !== 255 && rev - o + 1 >= 1) continue;
+      ledPath(c, s, 0); c.fill();
+    }
+    c.globalAlpha = 1;
+    const wrongShown = !sim.vCorrect && (st === ST_LOSS || st === ST_BACKWARD || st === ST_UPDATE || st === ST_TRAIN);
+    const mg = glitch || wrongShown;
+    if (rev >= 0) {
+      for (let s = 0; s < 7; s++) {
+        const o = LEDO[d * 7 + s]; if (o === 255) continue;
+        let a = rev - o + 1; if (a <= 0) continue; if (a > 1) a = 1;
+        const gi = (mg ? 7 : 0) + s, g = LEDG[gi];
+        c.globalAlpha = a; c.drawImage(g, LED_X + (glitch ? 1.6 : 0) + LEDGX[gi], LED_Y + LEDGY[gi], g.width / K, g.height / K);
+      }
+      c.lineWidth = 0.34; c.strokeStyle = PAL_HEX[mg ? 14 : 8];
+      for (let s = 0; s < 7; s++) {
+        const o = LEDO[d * 7 + s]; if (o === 255) continue;
+        let a = rev - o + 1; if (a <= 0) continue; if (a > 1) a = 1;
+        c.globalAlpha = a; ledBevel(c, s, glitch ? 1.6 : 0); c.stroke();
+      }
+      c.globalAlpha = 1;
+    }
+  }
+
+  // ---- legend line whose meaning changes with the phase
+  setFont(c, F_LEG, FS_LEG);
+  if (st === ST_FORWARD) text(c, 'PULSOS: W·A', 4, 116.5, 7);
+  else if (st === ST_LOSS && tt < TL_LOSS) text(c, 'PULSO: P(y)', 4, 116.5, 9);
+  else if (st === ST_BACKWARD) text(c, tt < BT0 ? 'PULSOS: ∂L/∂z' : 'PULSOS: ∂L/∂W', 4, 116.5, 13);
+  else if (st === ST_UPDATE && tt < 30) text(c, 'DESTELLO: ΔW', 4, 116.5, 8);
+  let wStart = 999; for (let i = 0; i < 16; i++) if (sim.nBwdT[i] < wStart) wStart = sim.nBwdT[i];
+  if ((st === ST_INPUT && tt >= 12) || (st === ST_FORWARD && tt < 40)) text(c, 'CABLES: x', 4, 121.2, 7);
+  else if (st === ST_BACKWARD && tt >= wStart) text(c, 'CABLES: ∂L/∂x', 4, 121.2, 13);
+  if (paintOn) {   // scale of the painting: same colors and opacity as the pixels, −max … 0 … +max of this image
+    drawF(c, FP_TITLE, 4, 92.6, FSB, TH_RES2);
+    for (let i = 0; i < 22; i++) { c.fillStyle = PBAR[i]; c.fillRect(4 + i, 94.3, 1.04, 1.5); }
+    setFont(c, F_TINY, FS_TINY); text(c, 'BAJA L', 4, 99.0, 7); text(c, 'SUBE L', 26 - textW(6), 99.0, 13);
+  }
+
+  // ---- right column: the prediction, the true label and this digit's loss, worked out as formulas
+  fillLV(sim);
+  const nx = PRED_X + 0.5, ny0 = PRED_Y + PRED_H + 7.5;
+  if (showWin) drawF(c, FR_PRED, nx, ny0, FSR, TH_FWD);             // probability the network gives its own prediction
+  if (st === ST_LOSS || st === ST_BACKWARD || st === ST_UPDATE || st === ST_TRAIN || (st === ST_SOLVED && tt >= 120)) {
+    const ok = sim.vLabel === sim.vPred;
+    const xc = drawF(c, FR_Y, nx, ny0 + 7, FSR, ok ? TH_FWD : TH_BWD) + 2.2;
+    setFont(c, F_CHIP, FS_CHIP);
+    c.strokeStyle = PAL_HEX[ok ? 6 : 12]; c.lineWidth = 0.22; roundRect(c, xc - 0.9, ny0 + 4.5, textW(ok ? 7 : 5) + 1.8, 3.4, 0.9); c.stroke();
+    text(c, ok ? 'ACIERTO' : 'ERROR', xc, ny0 + 7, ok ? 7 : 13);
+    if (st !== ST_SOLVED && (st !== ST_LOSS || tt >= TL_LOSS)) {   // L uses the probability of the TRUE class y
+      // P(y) with 4 significant digits, so −ln of the shown P(y) reproduces the shown L to its last digit
+      const xe = LOSS_TX + widthF(FR_LHEAD, FSR);
+      drawF(c, FR_L1, LOSS_TX, LOSS_Y + 10.6, FSR, TH_RES2);
+      const w2 = widthF(FR_L2, FSR);
+      drawF(c, FR_L2, xe + w2 > 253.6 ? 253.6 - w2 : xe, LOSS_Y + 16.4, FSR, TH_RES2);
+      drawF(c, sim.vLoss >= 10 ? FR_L3B : FR_L3, xe, LOSS_Y + 22.2, FSR, TH_RES);
+    }
+  }
+
+  // ---- particles (additive glow, white → main color → dark)
+  c.globalCompositeOperation = 'lighter';
+  for (let i = 0; i < PCAP; i++) {
+    const l = sim.plife[i]; if (l <= 0) continue;
+    let f = 1 - (l - alpha) / sim.pmax[i]; if (f < 0) f = 0; if (f > 1) f = 1;
+    if (sim.pkind[i] === 2) {
+      const sx = sim.psx[i] + 0.5, sy = sim.psy[i] + 0.5, tx = sim.ptx[i] + 0.5, ty = sim.pty[i] + 0.5;
+      const x = sx + (tx - sx) * f, y = sy + (ty - sy) * f;
+      const g = f > 0.18 ? f - 0.18 : 0, x2 = sx + (tx - sx) * g, y2 = sy + (ty - sy) * g;
+      c.globalAlpha = 0.7; c.strokeStyle = PAL_HEX[6]; c.lineWidth = 0.35; c.beginPath(); c.moveTo(x2, y2); c.lineTo(x, y); c.stroke();
+      glow(c, 7, x, y, 2, 0.9); glow(c, 9, x, y, 0.7, 1);
+    } else {
+      let ri = (f * 6) | 0; if (ri > 5) ri = 5;
+      const ci = sim.pkind[i] === 0 ? FR[5 - ri] : BR[5 - ri];
+      glow(c, ci, sim.px[i] + 0.5 + sim.pvx[i] * alpha, sim.py[i] + 0.5 + sim.pvy[i] * alpha, 1.5, 1 - f * 0.6);
+    }
+  }
+  c.globalCompositeOperation = 'source-over'; c.globalAlpha = 1;
+
+  // ---- phase indicator: "n/8 NAME  CAPTION" + 8-segment strip (segment width ∝ frame budget)
+  setFont(c, F_TOP, FS_TOP);
+  const lim = st === ST_SOLVED && sim.solveReason === 2;
+  const nm = lim ? 'RESET' : NAMES[st], cap = lim ? CAP_LIMIT : CAPS[st], pre = st === ST_SOLVED ? 0 : 4;
+  let tx = (LW - textW(pre + nm.length + 2 + cap.length)) / 2;
+  if (pre) tx = text(c, PHASE_NUM[st], tx, 6, 19) + textW(1);
+  tx = text(c, nm, tx, 6, PHASE_COL[st]) + textW(2);
+  text(c, cap, tx, 6, 18);
+  for (let sg = 0; sg < 8; sg++) {
+    const x0 = SEG_X[sg] + 0.3, w = SEG_W[sg] - 0.3, y = 8.6;
+    if (st === ST_SOLVED) {
+      c.globalAlpha = 0.55 + 0.45 * Math.sin(tt * 0.15 + sg); c.strokeStyle = PAL_HEX[sg & 1 ? 7 : 13]; c.lineWidth = 0.6;
+      c.beginPath(); c.moveTo(x0, y); c.lineTo(x0 + w, y); c.stroke(); c.globalAlpha = 1; continue;
+    }
+    if (sg < st) { c.strokeStyle = PAL_HEX[20]; c.lineWidth = 0.6; c.beginPath(); c.moveTo(x0, y); c.lineTo(x0 + w, y); c.stroke(); continue; }
+    c.setLineDash(DOTS16); c.strokeStyle = PAL_HEX[sg === st ? 20 : 23]; c.lineWidth = 0.5;
+    c.beginPath(); c.moveTo(x0, y); c.lineTo(x0 + w, y); c.stroke(); c.setLineDash(NODASH);
+    if (sg === st) {
+      const fx = x0 + w * Math.min(1, tt / DUR[st]);
+      c.strokeStyle = PAL_HEX[PHASE_COL[st]]; c.lineWidth = 0.7; c.beginPath(); c.moveTo(x0, y); c.lineTo(fx, y); c.stroke();
+      c.globalCompositeOperation = 'lighter'; glow(c, PHASE_COL[st], fx, y, 2.2, 0.8);
+      c.globalCompositeOperation = 'source-over'; c.globalAlpha = 1;
+    }
+  }
+  // ---- sound icon (top-left), speed / pause (top-right)
+  const ic = UI_SOUND === 1 ? 7 : 19;
+  c.fillStyle = PAL_HEX[ic]; c.beginPath();
+  c.moveTo(2.2, 2.7); c.lineTo(3.5, 2.7); c.lineTo(5.3, 1.1); c.lineTo(5.3, 5.9); c.lineTo(3.5, 4.3); c.lineTo(2.2, 4.3); c.closePath(); c.fill();
+  c.strokeStyle = PAL_HEX[ic]; c.lineWidth = 0.4; c.beginPath();
+  if (UI_SOUND === 1) {
+    c.moveTo(6.15, 2.32); c.arc(5.3, 3.5, 1.45, -0.95, 0.95);
+    c.moveTo(6.85, 1.32); c.arc(5.3, 3.5, 2.65, -0.95, 0.95);
+  } else { c.moveTo(6.7, 2.4); c.lineTo(8.9, 4.6); c.moveTo(8.9, 2.4); c.lineTo(6.7, 4.6); }
+  c.stroke();
+  setFont(c, F_LBL, FS_LBL);
+  if (UI_SOUND === 0) { c.globalAlpha = 0.55 + 0.45 * Math.sin(UI_BLINK * 0.08); text(c, 'TOCA: SONIDO', 10.5, 5.4, 18); c.globalAlpha = 1; }
+  if (UI_PAUSED) { c.globalAlpha = 0.55 + 0.45 * Math.sin(UI_BLINK * 0.12); text(c, 'PAUSA', 254 - textW(5), 5.4, 9); c.globalAlpha = 1; }
+  else { const sp = SPD_TXT[UI_SPEED]; text(c, sp, 254 - textW(sp.length), 5.4, UI_SPEED ? 8 : 19); }
+
+  // ---- formula row (what each layer computes) and value row (this digit's numbers), in step with the animation:
+  //      a formula lights only once its layer has actually been computed for this digit, its numbers appear with it
+  {
+    let fam = 0, litA = 0, litB = 0;          // fam: 0 forward, 1 backward, 2 update, 3 model summary, 4 fast training
+    switch (st) {
+      case ST_IDLE: fam = sim.trainStart >= 0 ? 4 : 3; break;
+      case ST_INPUT: if (tt >= 12) { litA = 1; litB = 1; } break;
+      case ST_FORWARD:
+        litA = 1 | (tt >= sim.ignF[1] ? 2 : 0) | (tt >= sim.ignF[2] ? 4 : 0) | (tt >= sim.ignF[3] ? 8 : 0); litB = litA & 7; break;
+      case ST_SOFTMAX: litA = 15; litB = tt >= 10 ? 15 : 7; break;
+      case ST_LOSS: litA = 15; litB = 15; break;
+      case ST_BACKWARD:
+        fam = 1;
+        litA = (tt >= sim.ignB[3] ? 8 : 0) | (tt >= sim.ignB[2] ? 4 : 0) | (tt >= sim.ignB[1] ? 2 : 0) | (tt >= sim.ignB[0] ? 1 : 0);
+        litB = litA & (tt >= sim.paintT0 ? 15 : 14); break;
+      case ST_UPDATE: fam = 2; break;
+      case ST_TRAIN: fam = 4; break;
+      case ST_SOLVED: fam = 3; break;
+    }
+    for (let q = 0; q < 4; q++) {
+      const on = (litA >> q) & 1, onB = (litB >> q) & 1, cx = SLOT_X[q];
+      if (fam === 0) { drawFC(c, FA_FWD[q], cx, ROW_A, FSA, on ? TH_FWD : TH_DIM); if (onB) drawFC(c, FB_FWD[q], cx, ROW_B, FSB, TH_FWD); }
+      else if (fam === 1) { drawFC(c, FA_BWD[q], cx, ROW_A, FSA, on ? TH_BWD : TH_DIM); if (onB) drawFC(c, FB_BWD[q], cx, ROW_B, FSB, TH_BWD); }
+      else if (fam === 2) { drawFC(c, FA_UPD[q], cx, ROW_A, FSA, TH_UPD); drawFC(c, FB_UPD[q], cx, ROW_B, FSB, TH_UPD); }
+      else if (fam === 4) { drawFC(c, FA_UPD[q], cx, ROW_A, FSA, TH_STAT); drawFC(c, q ? FB_SIZE[q] : FB_TRAIN, cx, ROW_B, FSB, q ? TH_STAT : TH_UPD); }
+      else { drawFC(c, FA_FWD[q], cx, ROW_A, FSA, TH_STAT); drawFC(c, FB_SIZE[q], cx, ROW_B, FSB, TH_STAT); }
+    }
+    drawF(c, FC_STATUS, 4, ROW_C, FSC, TH_ROWC);
+  }
+
+  // ---- learning card: loss (validation solid, training EMA dotted) and validation accuracy against the 95 % goal.
+  //      While training only validation numbers are shown; the test accuracy of the final model (chosen on validation)
+  //      appears once, at SOLVED.
+  {
+    const fin = st === ST_SOLVED && sim.finalTestAcc >= 0, xr = CARD_X + CARD_W - 1.8, n = sim.histN;
+    c.strokeStyle = PAL_HEX[23]; c.lineWidth = 0.25; roundRect(c, CARD_X, CARD_Y, CARD_W, CARD_H, 1.4); c.stroke();
+    // loss
+    setFont(c, F_CARD, FS_CARD); text(c, 'PÉRDIDA', CH_X - 0.2, 109.9, 19);
+    setFont(c, F_CARDV, FS_CARDV); c.fillStyle = PAL_HEX[7]; pnum(c, sim.valLoss, 2, xr - numChars(sim.valLoss, 2) * ADV * FS_CARDV, 109.9);
+    c.strokeStyle = PAL_HEX[23]; c.lineWidth = 0.18; c.beginPath(); c.moveTo(CH_X, LCH_Y + CH_H); c.lineTo(CH_X + CH_W, LCH_Y + CH_H); c.stroke();
+    setFont(c, F_AX, FS_AX); text(c, '2.5', CH_X + CH_W + 0.8, LCH_Y + 0.8, 20); text(c, '0', CH_X + CH_W + 0.8, LCH_Y + CH_H + 0.8, 20);
+    chart(c, sim.histTr, n, LMAX, LCH_Y, 18, 0.26, true);
+    chart(c, sim.hist, n, LMAX, LCH_Y, 7, 0.36, false);
+    // legend: solid = validation, dotted = training (EMA) with its current value
+    c.strokeStyle = PAL_HEX[7]; c.lineWidth = 0.36; c.beginPath(); c.moveTo(CH_X, 123.2); c.lineTo(CH_X + 2.2, 123.2); c.stroke();
+    setFont(c, F_LEGC, FS_LEGC);
+    let lx = text(c, 'VALID.', CH_X + 2.8, 124.0, 7) + 1.2;
+    c.strokeStyle = PAL_HEX[18]; c.lineWidth = 0.3; c.setLineDash(DOTS06); c.beginPath(); c.moveTo(lx, 123.2); c.lineTo(lx + 2.0, 123.2); c.stroke(); c.setLineDash(NODASH);
+    lx = text(c, 'ENTREN. EMA ', lx + 2.6, 124.0, 18); c.fillStyle = PAL_HEX[18]; pnum(c, net.trainLoss, 2, lx, 124.0);
+    // accuracy
+    const acc = fin ? sim.finalTestAcc : sim.valAcc;
+    setFont(c, F_CARD, FS_CARD); text(c, 'ACIERTO', CH_X - 0.2, 127.7, 19);
+    setFont(c, F_CARDV, FS_CARDV);
+    const ax = xr - (numChars(acc * 100, 1) + 1) * ADV * FS_CARDV;
+    if (sim.evalAge < 30 && !fin) { c.globalCompositeOperation = 'lighter'; glow(c, 6, ax + 5, 126.5, 6, 0.5 * (1 - sim.evalAge / 30)); c.globalCompositeOperation = 'source-over'; c.globalAlpha = 1; }
+    c.fillStyle = PAL_HEX[fin ? 9 : 7]; const ax2 = pnum(c, acc * 100, 1, ax, 127.7); c.fillText('%', ax2, 127.7);
+    c.strokeStyle = PAL_HEX[23]; c.lineWidth = 0.18; c.beginPath(); c.moveTo(CH_X, ACH_Y + CH_H); c.lineTo(CH_X + CH_W, ACH_Y + CH_H); c.stroke();
+    const yg = ACH_Y + CH_H - 0.95 * CH_H;                             // the goal: validation ≥ 95 % on two cycles
+    c.strokeStyle = PAL_HEX[19]; c.lineWidth = 0.18; c.setLineDash(DASH05); c.beginPath(); c.moveTo(CH_X, yg); c.lineTo(CH_X + CH_W, yg); c.stroke(); c.setLineDash(NODASH);
+    setFont(c, F_AX, FS_AX); text(c, 'META 95%', CH_X, yg - 0.75, 19);           // above the line, clear of the curve
+    text(c, '100', CH_X + CH_W + 0.8, ACH_Y + 0.8, 20); text(c, '0', CH_X + CH_W + 0.8, ACH_Y + CH_H + 0.8, 20);
+    chart(c, sim.histAcc, n, 1, ACH_Y, 7, 0.36, false);
+    if (n > 0) {
+      c.globalCompositeOperation = 'lighter';
+      glow(c, 9, CH_X + (n - 1) * CH_W / 31, LCH_Y + CH_H - Math.min(1, sim.hist[n - 1] / LMAX) * CH_H, 1.2, 0.9);
+      glow(c, 9, CH_X + (n - 1) * CH_W / 31, ACH_Y + CH_H - Math.min(1, sim.histAcc[n - 1]) * CH_H, 1.2, 0.9);
+      if (fin) glow(c, 9, CH_X + CH_W, ACH_Y + CH_H - sim.finalTestAcc * CH_H, 1.8, 1);
+      c.globalCompositeOperation = 'source-over'; c.globalAlpha = 1;
+    }
+    setFont(c, F_TINY, FS_TINY); c.fillStyle = PAL_HEX[18];
+    const bx = pnum(c, Math.round(acc * (fin ? NTEST : NVAL)), 0, CH_X - 0.2, 142.5);
+    text(c, fin ? ' de 500 · TEST, 1 VEZ' : ' de 500 · VALIDACIÓN', bx, 142.5, 19);
+  }
+}
+
+// ---------------------------------------------------------------- headless self-test
+function selfTest() {
+  const T0 = nowMs(); let pass = true;
+  const check = function (c, m) { console.assert(c, m); if (!c) { pass = false; console.log('SELFTEST FAIL: ' + m); } };
+
+  // 1) state machine: 8 states in order, back to IDLE, 445 frames per cycle; particle pool bounded
+  const sim = new Sim(NET_SEED0); sim.noSolve = true;
+  const NC = 3, seq = [], lens = [];
+  let prev = -1, cs = 0;
+  for (let f = 0; f < CYCLE_FRAMES * NC; f++) {
+    if (sim.state !== prev) { if (sim.state === ST_IDLE && prev !== -1) { lens.push(f - cs); cs = f; } seq.push(sim.state); prev = sim.state; }
+    sim.step();
+    check(sim.alive <= PCAP, 'particle pool within capacity');
+  }
+  lens.push(CYCLE_FRAMES * NC - cs);
+  let orderOk = seq.length === 8 * NC; for (let i = 0; i < seq.length; i++) if (seq[i] !== i % 8) orderOk = false;
+  check(orderOk, 'states visited in order IDLE..TRAIN each cycle');
+  check(sim.state === ST_IDLE && sim.t === 0, 'cycle returns to IDLE');
+  check(lens.length === NC && lens.every(function (l) { return l === CYCLE_FRAMES; }), 'each cycle lasts ' + CYCLE_FRAMES + ' frames: ' + lens.join(','));
+  const loopMax = sim.maxAlive;
+  for (let i = 0; i < PCAP * 3; i++) sim.spawn(10, 10, 0, 0, 30, 0, 0);
+  check(sim.alive <= PCAP && sim.maxAlive <= PCAP, 'particle pool never exceeds capacity (max ' + sim.maxAlive + '/' + PCAP + ')');
+
+  // 2) softmax sums to 1
+  const net = new Net(); net.reset(NET_SEED0);
+  let worst = 0;
+  for (let s = 0; s < 200; s++) { net.forward(testX, s * N0); let sum = 0; for (let k = 0; k < 10; k++) sum += net.p[k]; worst = Math.max(worst, Math.abs(sum - 1)); }
+  check(worst <= 1e-5, 'softmax sums to 1 (max err ' + worst.toExponential(2) + ')');
+
+  // 2b) cross-entropy in the log domain (log-sum-exp, like PyTorch's LogSoftmax + NLLLoss): equals −ln p_y in the
+  //     normal range and stays exact when p_y underflows (logit gap 150: p_y = e^−150 is 0 in float32)
+  let lseBad = 0;
+  for (let s = 0; s < 200; s++) { net.forward(testX, s * N0); const y = testY[s]; if (Math.abs(net.nll(y) + Math.log(net.p[y])) > 1e-6 * Math.max(1, net.nll(y))) lseBad++; }
+  const xn = new Net(); xn.reset(NET_SEED0); xn.W3.fill(0); xn.b3.fill(0); xn.b3[3] = 150; xn.forward(testX, 0);
+  const lExt = xn.nll(0), lClamp = -Math.log(Math.max(xn.p[0], 1e-12));
+  let pz = 0; for (let k = 0; k < 10; k++) pz += xn.p[k];
+  check(lseBad === 0 && Math.abs(lExt - 150) < 1e-9 && xn.p[0] === 0 && Math.abs(pz - 1) < 1e-6,
+    'log-domain cross-entropy: = −ln p_y on 200 digits, exact at a logit gap of 150 (L = ' + lExt + '; −ln max(p, 1e−12) would give ' + lClamp.toFixed(2) + ')');
+
+  // 3) gradient check: analytic backprop vs central difference (eps 1e-4, float64 reference)
+  const gn = new Net(); gn.reset(NET_SEED0 + 99); for (let k = 0; k < 20; k++) gn.trainStep();
+  const SAMP = [11, 222, 1333, 2444], NS = SAMP.length;
+  gn.zeroGrads();
+  for (const s of SAMP) { gn.forward(trainX, s * N0); gn.deltas(trainY[s]); gn.accumulate(trainX, s * N0); }
+  const P64 = [Float64Array.from(gn.W1), Float64Array.from(gn.b1), Float64Array.from(gn.W2), Float64Array.from(gn.b2), Float64Array.from(gn.W3), Float64Array.from(gn.b3)];
+  const G = [gn.gW1, gn.gb1, gn.gW2, gn.gb2, gn.gW3, gn.gb3];
+  const refLoss = function () {
+    const [W1, b1, W2, b2, W3, b3] = P64; let tot = 0;
+    const h1 = new Float64Array(N1), h2 = new Float64Array(N2), z = new Float64Array(N3);
+    for (const s of SAMP) {
+      const off = s * N0;
+      for (let j = 0; j < N1; j++) { let a = b1[j]; for (let i = 0; i < N0; i++) a += trainX[off + i] * W1[i * N1 + j]; h1[j] = a > 0 ? a : 0; }
+      for (let j = 0; j < N2; j++) { let a = b2[j]; for (let i = 0; i < N1; i++) a += h1[i] * W2[i * N2 + j]; h2[j] = a > 0 ? a : 0; }
+      let m = -Infinity; for (let k = 0; k < N3; k++) { let a = b3[k]; for (let i = 0; i < N2; i++) a += h2[i] * W3[i * N3 + k]; z[k] = a; if (a > m) m = a; }
+      let se = 0; for (let k = 0; k < N3; k++) se += Math.exp(z[k] - m);
+      tot += -(z[trainY[s]] - m - Math.log(se));
+    }
+    return tot / NS;
+  };
+  const gr = new Rng(4242); let gworst = 0, gcount = 0;
+  const nz = []; for (let i = 0; i < N0; i++) if (trainX[SAMP[0] * N0 + i] > 0.3) nz.push(i);
+  const names = ['W1', 'b1', 'W2', 'b2', 'W3', 'b3'];
+  for (let pi = 0; pi < 6; pi++) {
+    let lw = 0;
+    for (let trial = 0; trial < 10; trial++) {
+      const len = P64[pi].length;
+      const idx = pi === 0 ? nz[gr.int(nz.length)] * N1 + gr.int(N1) : gr.int(len);
+      const orig = P64[pi][idx], eps = 1e-4;
+      P64[pi][idx] = orig + eps; const lp = refLoss();
+      P64[pi][idx] = orig - eps; const lm = refLoss();
+      P64[pi][idx] = orig;
+      const num = (lp - lm) / (2 * eps), ana = G[pi][idx] / NS;
+      const den = Math.max(Math.abs(num), Math.abs(ana));
+      const rel = den < 1e-7 ? 0 : Math.abs(num - ana) / den;
+      if (rel > lw) lw = rel; gcount++;
+    }
+    check(lw <= 1e-3, 'gradient check ' + names[pi] + ' rel err ' + lw.toExponential(2));
+    if (lw > gworst) gworst = lw;
+  }
+
+  // 3b) He initialization (He et al. 2015, eq. 12; = PyTorch kaiming_normal_(fan_in, ReLU gain √2)): N(0, 2/fan_in), b = 0
+  let heBad = 0; const heTxt = [];
+  for (const sd of [NET_SEED0, NET_SEED0 + 1, NET_SEED0 + 2]) {
+    const hn = new Net(); hn.reset(sd);
+    const L3 = [[hn.W1, N0], [hn.W2, N1], [hn.W3, N2]];
+    for (let q = 0; q < 3; q++) {
+      const a = L3[q][0], n = a.length, sig = Math.sqrt(2 / L3[q][1]);
+      let m = 0; for (let i = 0; i < n; i++) m += a[i]; m /= n;
+      let v = 0; for (let i = 0; i < n; i++) v += (a[i] - m) * (a[i] - m);
+      const sh = Math.sqrt(v / n);
+      if (Math.abs(sh / sig - 1) > 4 / Math.sqrt(2 * n) || Math.abs(m) > 4 * sig / Math.sqrt(n)) heBad++;   // 4 standard errors
+      if (sd === NET_SEED0) heTxt.push('W' + (q + 1) + ' σ ' + sh.toFixed(4) + ' vs √(2/' + L3[q][1] + ') ' + sig.toFixed(4));
+    }
+    for (const b of [hn.b1, hn.b2, hn.b3]) for (let i = 0; i < b.length; i++) if (b[i] !== 0) heBad++;
+  }
+  check(heBad === 0, 'He initialization N(0, 2/fan_in), zero biases, 3 seeds (' + heTxt.join('; ') + ')');
+
+  // 4) real learning from the initial seed on 500 held-out test digits
+  const ln = new Net(); ln.reset(NET_SEED0);
+  let stepsTo = -1, acc = 0;
+  while (ln.steps < MAX_STEPS) {
+    for (let k = 0; k < 50; k++) ln.trainStep();
+    acc = ln.evaluate(testX, testY, NTEST, null);
+    if (acc >= 0.93) { stepsTo = ln.steps; break; }
+  }
+  check(stepsTo > 0, 'reaches >=93% test accuracy within ' + MAX_STEPS + ' steps');
+  const conf = new Int32Array(100); ln.evaluate(testX, testY, NTEST, conf);
+
+  // 4b) three-way holdout as in practice: the 500 validation digits decide SOLVED (≥ 95% on two consecutive cycles);
+  //     the test set is not read at all before SOLVED, then once on the model that was chosen
+  const sv = new Sim(NET_SEED0); let svFrames = 0, svBad = 0, testReads = 0, valAtSolve = -1, testAtSolve = -1;
+  const fwd0 = sv.net.forward;
+  sv.net.forward = function (X, off) { if (X === testX && sv.state !== ST_SOLVED) testReads++; return fwd0.call(this, X, off); };
+  while (sv.state !== ST_SOLVED && svFrames < CYCLE_FRAMES * 45) { sv.step(); svFrames++; }
+  const solvedOk = sv.state === ST_SOLVED && sv.solveReason === 1;
+  if (solvedOk) {
+    const vc = new Net();
+    vc.W1.set(sv.net.W1); vc.b1.set(sv.net.b1); vc.W2.set(sv.net.W2); vc.b2.set(sv.net.b2); vc.W3.set(sv.net.W3); vc.b3.set(sv.net.b3);
+    valAtSolve = vc.evaluate(valX, valY, NVAL, null);
+    if (valAtSolve < 0.95 || valAtSolve !== sv.valAcc || Math.abs(vc.lastLoss - sv.valLoss) > 1e-9 || sv.streak < 2) svBad++;
+    testAtSolve = vc.evaluate(testX, testY, NTEST, null);
+    if (testAtSolve !== sv.finalTestAcc || Math.abs(vc.lastLoss - sv.finalTestLoss) > 1e-9) svBad++;
+    for (let c = 0; c < 10; c++) { const q = sv.paradeIdx[c]; vc.forward(testX, q * N0); if (vc.argmax() !== testY[q]) svBad++; }
+  }
+  check(solvedOk && svBad === 0 && testReads === 0, 'SOLVED decided on validation (' + (valAtSolve * 100).toFixed(1) + '% at step ' + sv.net.steps +
+    '), test set read ' + testReads + ' times before it, then once: ' + (testAtSolve * 100).toFixed(1) + '% (' + svBad + ' mismatches)');
+  let rows = '      pred 0   1   2   3   4   5   6   7   8   9\n';
+  for (let y = 0; y < 10; y++) {
+    rows += 'true ' + y + ' ';
+    for (let p = 0; p < 10; p++) { const s = String(conf[y * 10 + p]); rows += '   '.slice(s.length - 1) + s + ' '; }
+    rows += '\n';
+  }
+  // 5) the animation never runs ahead of the math (checked on 6 real cycles)
+  const vs = new Sim(NET_SEED0); vs.noSolve = true;
+  let syncBad = 0, readBad = 0, intBad = 0, cyc = 0;
+  const raw = new Float64Array(NE), mx = new Float64Array(3);
+  for (let f = 0; f < CYCLE_FRAMES * 6; f++) {
+    vs.step();
+    if (vs.state !== ST_FORWARD || vs.t !== 1) continue;
+    cyc++;
+    for (let e = 0; e < NE; e++) {
+      const L = vs.eL[e], dn = LOFF[L + 1] + vs.eD[e], sn = LOFF[L] + vs.eS[e];
+      if (vs.nFwdT[dn] < vs.eFT[e] + TRAVEL) syncBad++;          // a neuron lights only after this pulse arrived
+      if (L > 0 && vs.eFT[e] < vs.nFwdT[sn]) syncBad++;           // a pulse leaves only after its source lit
+      if (vs.eBT[e] < vs.nBwdT[dn]) syncBad++;                    // backward leaves only once δ of the next layer exists
+      if (vs.nBwdT[sn] < vs.eBT[e] + TRAVEL_B) syncBad++;         // δ shown only after its incoming pulses arrived
+      if (vs.eFT[e] + TRAVEL >= DUR[ST_FORWARD] || vs.eBT[e] + TRAVEL_B >= DUR[ST_BACKWARD]) syncBad++;
+    }
+    for (let k = 0; k < 10; k++) {                                 // output δ appears when ∂L/∂z_k arrives from the loss node,
+      if (vs.nBwdT[48 + k] !== LOSS_ST[k] + TL_LOSS || vs.nBwdT[48 + k] > BT0) syncBad++;   // before any layer pulse leaves
+    }
+    let wmaxT = 0; for (let i = 0; i < 16; i++) wmaxT = Math.max(wmaxT, vs.nBwdT[i] + TW);
+    if (vs.paintT0 < wmaxT || vs.paintT0 + PAINT_D >= DUR[ST_BACKWARD]) syncBad++;   // painting only after every wire reached its pixel
+    let sum = 0, am = 0;
+    for (let k = 0; k < 10; k++) { sum += vs.vp[k]; if (vs.vp[k] > vs.vp[am]) am = k; }
+    if (Math.abs(sum - 1) > 1e-5 || am !== vs.vPred) readBad++;
+    for (let pass2 = 0; pass2 < 2; pass2++) {                     // pulse intensity == |w·a| (fwd) / |δ·a| (bwd), per-layer normalized
+      mx.fill(1e-12);
+      for (let e = 0; e < NE; e++) {
+        const L = vs.eL[e], sI = vs.eS[e], dI = vs.eD[e];
+        const a = L === 0 ? vs.vIn[sI] : L === 1 ? vs.va1[sI] : vs.va2[sI];
+        const dd = L === 0 ? vs.vd1[dI] : L === 1 ? vs.vd2[dI] : vs.vd3[dI];
+        raw[e] = pass2 === 0 ? Math.abs(vs.layerW(L)[vs.eWI[e]] * a) : Math.abs(dd * a);
+        if (raw[e] > mx[L]) mx[L] = raw[e];
+      }
+      for (let e = 0; e < NE; e++) if (Math.abs(raw[e] / mx[vs.eL[e]] - (pass2 === 0 ? vs.eFI[e] : vs.eBI[e])) > 1e-5) intBad++;
+    }
+  }
+  check(cyc === 6 && syncBad === 0, 'pulse/ignition ordering matches forward & backward dependencies (' + syncBad + ' violations)');
+  check(readBad === 0, 'displayed prediction is argmax of a normalized softmax');
+  check(intBad === 0, 'pulse intensities equal |w·a| and |δ·a| of the highlighted sample');
+  check(vs.hlChecks === 6 && vs.hlFails === 0, 'highlighted sample belongs to the mini-batch applied at UPDATE (' + vs.hlChecks + ' cycles)');
+
+  // 6) the update is exactly SGD with momentum: v ← μv − η·mean(g), w ← w + v
+  const sn = new Net(); sn.reset(NET_SEED0); for (let k = 0; k < 3; k++) sn.trainStep();
+  sn.ensureBatch();
+  const w0 = Float64Array.from(sn.W2), v0 = Float64Array.from(sn.vW2), bb0 = Float64Array.from(sn.b3), vb0 = Float64Array.from(sn.vb3);
+  sn.zeroGrads();
+  for (let b = 0; b < BATCH; b++) { const s = sn.perm[sn.ptr + b]; sn.forward(trainX, s * N0); sn.deltas(trainY[s]); sn.accumulate(trainX, s * N0); }
+  const g2 = Float64Array.from(sn.gW2), gb3 = Float64Array.from(sn.gb3);
+  sn.trainStep();
+  let sgdBad = 0;
+  for (let i = 0; i < g2.length; i++) { const ve = MOM * v0[i] - LR * g2[i] / BATCH; if (Math.abs(sn.vW2[i] - ve) > 1e-6 || Math.abs(sn.W2[i] - (w0[i] + ve)) > 1e-6) sgdBad++; }
+  for (let i = 0; i < gb3.length; i++) { const ve = MOM * vb0[i] - LR * gb3[i] / BATCH; if (Math.abs(sn.vb3[i] - ve) > 1e-6 || Math.abs(sn.b3[i] - (bb0[i] + ve)) > 1e-6) sgdBad++; }
+  check(sgdBad === 0, 'parameter update equals SGD+momentum formula (' + sgdBad + ' mismatches)');
+
+  // 6b) same trajectory as PyTorch SGD(momentum=μ): b ← μb + g (b₁ = g₁), θ ← θ − η·b. PyTorch's docs note that this
+  //     form differs from Sutskever et al. / Keras (v ← μv − ηg, θ ← θ + v, used here); with a constant η both give the
+  //     same parameters at every step, which is what this checks
+  const NPT = 64, wa = new Float64Array(NPT), va = new Float64Array(NPT), wb = new Float64Array(NPT), bb = new Float64Array(NPT), gg = new Float64Array(NPT);
+  const pr = new Rng(77); for (let i = 0; i < NPT; i++) { wa[i] = pr.gauss(); wb[i] = wa[i]; }
+  for (let t = 1; t <= 200; t++) {
+    for (let i = 0; i < NPT; i++) gg[i] = Math.sin(0.37 * t + i) + 0.5 * wa[i];          // a gradient that depends on θ
+    sgd(wa, va, gg, 1);
+    for (let i = 0; i < NPT; i++) { const g = Math.sin(0.37 * t + i) + 0.5 * wb[i]; bb[i] = t === 1 ? g : MOM * bb[i] + g; wb[i] -= LR * bb[i]; }
+  }
+  let ptMax = 0; for (let i = 0; i < NPT; i++) ptMax = Math.max(ptMax, Math.abs(wa[i] - wb[i]));
+  check(ptMax < 1e-10, 'same trajectory as PyTorch SGD(momentum=0.9) over 200 steps (max |Δθ| ' + ptMax.toExponential(1) + ')');
+
+  // 6c) TRAIN LOSS (EMA): before step 1 the loss of the initial weights on the first mini-batch; then the β = 0.9 moving
+  //     average of the mini-batch losses divided by 1 − β^t (bias correction of a zero-started average, Adam §3)
+  const en = new Net(); en.reset(NET_SEED0 + 5);
+  let e0 = 0; for (let b = 0; b < BATCH; b++) { const q = en.perm[b]; en.forward(trainX, q * N0); e0 += en.nll(trainY[q]); }
+  let emaBad = Math.abs(en.trainLoss - e0 / BATCH) > 1e-12 ? 1 : 0, emaRaw = 0;
+  for (let k = 1; k <= 60; k++) {
+    const l = en.trainStep(); emaRaw = 0.9 * emaRaw + 0.1 * l;
+    if (Math.abs(en.trainLoss - emaRaw / (1 - Math.pow(0.9, k))) > 1e-12 || (k === 1 && Math.abs(en.trainLoss - l) > 1e-12)) emaBad++;
+  }
+  check(emaBad === 0, 'TRAIN LOSS (EMA) = bias-corrected moving average of the mini-batch losses (' + emaBad + ' mismatches)');
+
+  // 7) determinism: same seed → bit-identical weights and events
+  const da = new Sim(NET_SEED0), db = new Sim(NET_SEED0); da.noSolve = db.noSolve = true;
+  for (let f = 0; f < 900; f++) { da.step(); db.step(); }
+  let same = da.evHead === db.evHead && da.alive === db.alive;
+  for (let i = 0; i < N0 * N1; i++) if (da.net.W1[i] !== db.net.W1[i]) { same = false; break; }
+  check(same, 'deterministic: two runs with the same seed are bit-identical');
+
+  // 8) the 500 test digits never appear in the training set
+  const hashImg = function (X, s) { let h = 2166136261; for (let i = 0; i < N0; i++) { h ^= Math.round(X[s * N0 + i] * 255); h = Math.imul(h, 16777619); } return h >>> 0; };
+  const seen = new Set(); for (let s = 0; s < NTRAIN; s++) seen.add(hashImg(trainX, s));
+  let dup = 0; for (let s = 0; s < NTEST; s++) if (seen.has(hashImg(testX, s))) dup++;
+  check(dup === 0, 'test set disjoint from training set (' + dup + ' duplicates)');
+  const seenT = new Set(); for (let q = 0; q < NTEST; q++) seenT.add(hashImg(testX, q));
+  let dupV = 0; for (let q = 0; q < NVAL; q++) { const h = hashImg(valX, q); if (seen.has(h) || seenT.has(h)) dupV++; }
+  check(dupV === 0, 'validation set disjoint from training and test sets (' + dupV + ' duplicates)');
+
+  // 9) everything displayed equals an independent recomputation (weights copied into a separate network)
+  const ds = new Sim(NET_SEED0); ds.noSolve = true;
+  const chk = new Net();
+  const copyW = function () { chk.W1.set(ds.net.W1); chk.b1.set(ds.net.b1); chk.W2.set(ds.net.W2); chk.b2.set(ds.net.b2); chk.W3.set(ds.net.W3); chk.b3.set(ds.net.b3); };
+  const meshErrors = function () {     // top-5 |w| among the 16 visible sources per destination, sign, brightness class
+    let bad = 0; const sel = new Uint8Array(16);
+    for (let L = 0; L < 3; L++) {
+      const nd = LN[L + 1], W = ds.layerW(L); let mx = 0;
+      for (let e = 0; e < NE; e++) if (ds.eL[e] === L && ds.eAbs[e] > mx) mx = ds.eAbs[e];
+      for (let d = 0; d < nd; d++) {
+        sel.fill(0); let minSel = Infinity, cnt = 0;
+        for (let e = 0; e < NE; e++) {
+          if (ds.eL[e] !== L || ds.eD[e] !== d) continue;
+          const s = ds.eS[e], w = W[(L === 0 ? SAMPLE_PIX[s] : s) * nd + d];
+          sel[s] = 1; cnt++; if (Math.abs(w) < minSel) minSel = Math.abs(w);
+          if ((w < 0 ? 1 : 0) !== ds.eNeg[e] || Math.abs(w) !== ds.eAbs[e]) bad++;
+          if ((Math.abs(w) / mx >= 0.6 ? 23 : 2) !== ds.eRest[e]) bad++;
+          if (Math.min(NWL - 1, Math.floor(Math.abs(w) / mx * NWL)) !== ds.eWL[e]) bad++;   // thickness level ∝ |w|
+        }
+        if (cnt !== K_TOP) bad++;
+        for (let s = 0; s < 16; s++) if (!sel[s] && Math.abs(W[(L === 0 ? SAMPLE_PIX[s] : s) * nd + d]) > minSel) bad++;
+      }
+    }
+    return bad;
+  };
+  let dispBad = 0, lvlBad = 0, gradBad = 0, meshBad = 0, meshChecks = 0, hudBad = 0, epochBad = 0, nCyc = 0, nEval = 0;
+  for (let f = 0; f < CYCLE_FRAMES * 6; f++) {
+    ds.step();
+    const net = ds.net, st = ds.state;
+    if (st === ST_INPUT && ds.t === 0) {                         // the highlighted sample as drawn this cycle
+      nCyc++; copyW();
+      const s = ds.vSample, off = s * N0;
+      chk.forward(trainX, off);
+      let am = 0;
+      for (let k = 0; k < 10; k++) { if (Math.abs(chk.p[k] - ds.vp[k]) > 1e-6) dispBad++; if (chk.p[k] > chk.p[am]) am = k; }
+      if (am !== ds.vPred || trainY[s] !== ds.vLabel || ds.dispX !== trainX || ds.dispOff !== off) dispBad++;
+      if (Math.abs(ds.vLoss - chk.nll(ds.vLabel)) > 1e-9 || Math.abs(ds.vLoss + Math.log(chk.p[ds.vLabel])) > 1e-5) dispBad++;   // L = −ln p_y
+      for (let i = 0; i < 16; i++) if (ds.vIn[i] !== trainX[off + SAMPLE_PIX[i]]) dispBad++;     // input neurons = pixels
+      chk.deltas(ds.vLabel);
+      let gmx = 0;                                                 // painted image = ∂L/∂x = W1·δ1 for all 784 pixels
+      for (let i = 0; i < N0; i++) {
+        let g = 0; for (let j = 0; j < N1; j++) g += chk.W1[i * N1 + j] * chk.d1[j];
+        if (Math.abs(g - ds.vg[i]) > 1e-6) gradBad++; if (Math.abs(g) > gmx) gmx = Math.abs(g);
+      }
+      if (Math.abs(gmx - ds.vgMax) > 1e-6) gradBad++;
+      for (let i = 0; i < 16; i++) if (ds.vd0[i] !== ds.vg[SAMPLE_PIX[i]]) gradBad++;
+      let gxm = 0;                                                 // painted contribution = x·∂L/∂x
+      for (let i = 0; i < N0; i++) { const v = Math.fround(trainX[off + i] * ds.vg[i]); if (v !== ds.vgx[i]) gradBad++; if (Math.abs(v) > gxm) gxm = Math.abs(v); }
+      if (gxm !== ds.vgxMax) gradBad++;
+      for (let i = 0; i < 16; i++) {                               // OFF ⇔ exactly zero, for activations and deltas
+        if ((ds.fwdLv[i] === 0) !== (ds.vIn[i] === 0)) lvlBad++;
+        { let m0 = 0; for (let q = 0; q < 16; q++) if (ds.vIn[q] > m0) m0 = ds.vIn[q];
+          if (ds.vIn[i] > 0 && ds.fwdLv[i] !== (ds.vIn[i] / m0 < 0.55 ? 1 : 2)) lvlBad++; }
+        { let m1 = 0; for (let q = 0; q < 16; q++) if (chk.a1[q] > m1) m1 = chk.a1[q];
+          if (chk.a1[i] > 0 && ds.fwdLv[16 + i] !== (chk.a1[i] / m1 < 0.55 ? 1 : 2)) lvlBad++; }
+        if ((ds.fwdLv[16 + i] === 0) !== (chk.a1[i] === 0)) lvlBad++;
+        if ((ds.fwdLv[32 + i] === 0) !== (chk.a2[i] === 0)) lvlBad++;
+        if ((ds.bwdLv[16 + i] === 0) !== (chk.d1[i] === 0)) lvlBad++;
+        if ((ds.bwdLv[32 + i] === 0) !== (chk.d2[i] === 0)) lvlBad++;
+        let g0 = 0; for (let j = 0; j < N1; j++) g0 += chk.W1[SAMPLE_PIX[i] * N1 + j] * chk.d1[j];
+        if (Math.abs(g0 - ds.vd0[i]) > 1e-6) lvlBad++;
+      }
+      for (let k = 0; k < 10; k++) { if ((ds.bwdLv[48 + k] === 0) !== (chk.d3[k] === 0)) lvlBad++; if ((ds.fwdLv[48 + k] === 1) !== (chk.p[k] >= 0.1)) lvlBad++; }
+    }
+    if (st === ST_INPUT && ds.t === 13) {                       // every lit input neuron gets its particle (no more, no less)
+      let nzp = 0; for (let i = 0; i < 16; i++) if (ds.vIn[i] !== 0) nzp++;
+      if (ds.inputSpawned !== nzp) dispBad++;
+    }
+    if (st === ST_TRAIN && ds.t === 22) {                       // VAL ACC / sparkline value right after an evaluation
+      nEval++; copyW(); chk.evaluate(valX, valY, NVAL, null);
+      if (chk.lastAcc !== ds.valAcc || Math.abs(chk.lastLoss - ds.valLoss) > 1e-6 || Math.abs(ds.hist[ds.histN - 1] - ds.valLoss) > 1e-6) hudBad++;
+    }
+    if (!(st === ST_UPDATE && ds.t <= 30)) { meshChecks++; meshBad += meshErrors(); }   // UPDATE 0–30 shows the pre-update edges on purpose
+    if (net.steps > 0) {
+      const lo = Math.floor((net.steps - 1) / 93) + 1, hi = Math.floor(net.steps / 93) + 1;
+      if (net.epoch < lo || net.epoch > hi) epochBad++;
+    }
+  }
+  check(nCyc === 6 && dispBad === 0, 'P, Y, L, prediction and input neurons equal an independent recomputation (' + dispBad + ' mismatches)');
+  check(lvlBad === 0, 'a neuron is drawn OFF exactly when its activation / delta is zero (' + lvlBad + ' mismatches)');
+  check(gradBad === 0, '∂L/∂x = W1·δ1 for all 784 pixels and the painted x·∂L/∂x match (' + gradBad + ' mismatches)');
+  check(meshBad === 0, 'drawn mesh = current top-5 |w| with correct sign, brightness and thickness on ' + meshChecks + ' frames (' + meshBad + ' errors)');
+  check(nEval >= 6 && hudBad === 0, 'VAL ACC / VAL LOSS equal a full re-evaluation of the 500 validation digits (' + hudBad + ' mismatches)');
+  check(epochBad === 0, 'EPOCH counter consistent with STEP (93 batches per epoch)');
+  let pixBad = 0;
+  for (let i = 0; i < 16; i++) {
+    const q = SAMPLE_PIX[i], r = (q / 28) | 0, cc = q % 28;
+    if (r < 3 || r > 24 || cc < 3 || cc > 24) pixBad++;
+    if (i && SAMPLE_PIX[i] <= SAMPLE_PIX[i - 1]) pixBad++;
+  }
+  check(pixBad === 0, '16 drawn input pixels are distinct, central and ordered top→bottom');
+
+  // 10) the 7-segment patterns are the standard ones, with segments where they belong
+  const STD7 = ['abcdef', 'bc', 'abdeg', 'abcdg', 'bcfg', 'acdfg', 'acdefg', 'abc', 'abcdefg', 'abcdfg'];
+  let ledBad = 0;
+  for (let d = 0; d < 10; d++) for (let q = 0; q < 7; q++) if ((LEDO[d * 7 + q] !== 255) !== (STD7[d].indexOf('abcdefg'[q]) >= 0)) ledBad++;
+  const sc = function (q, k) { let v = 0; for (let j = 0; j < 6; j++) v += LEDP[q * 12 + 2 * j + k]; return v / 6; };
+  if (!(sc(0, 1) < sc(6, 1) && sc(6, 1) < sc(3, 1) && sc(1, 0) > sc(6, 0) && sc(2, 0) > sc(6, 0) && sc(4, 0) < sc(6, 0) && sc(5, 0) < sc(6, 0) &&
+        sc(1, 1) < sc(6, 1) && sc(5, 1) < sc(6, 1) && sc(2, 1) > sc(6, 1) && sc(4, 1) > sc(6, 1))) ledBad++;
+  check(ledBad === 0, '7-segment display shows the standard patterns for 0–9');
+
+  // 11) the TEXT actually drawn on screen equals the values: render() into a recording context, rebuild every line
+  const RS = [MAKE_CANVAS, STATIC, STATIC_KEY, SPR, DIGC, DIGX, DIGI, PNTC, PNTX, PNTI, VW, VH, K, OX, OY, ADV, LEDG];
+  const TX = [], nop = function () {};
+  const rec = { font: '', fillStyle: '', strokeStyle: '', lineWidth: 1, lineCap: '', lineJoin: '', textBaseline: '', globalAlpha: 1,
+    globalCompositeOperation: '', shadowBlur: 0, shadowColor: '', imageSmoothingEnabled: true, imageSmoothingQuality: '',
+    setTransform: nop, fillRect: nop, strokeRect: nop, drawImage: nop, beginPath: nop, moveTo: nop, lineTo: nop, arc: nop, arcTo: nop,
+    closePath: nop, fill: nop, stroke: nop, rect: nop, clip: nop, save: nop, restore: nop, setLineDash: nop, putImageData: nop,
+    fillText: function (str, x, y) { TX.push([str, x, y, this.fillStyle]); },
+    measureText: function (str) { return { width: str.length * (this.font.indexOf('monospace') >= 0 ? 60.2 : 46) }; },
+    createRadialGradient: function () { return { addColorStop: nop }; },
+    createImageData: function (w, h) { return { data: new Uint8ClampedArray(w * h * 4) }; } };
+  let txtBad = 0, txtFrames = 0, txtWrong = 0, rowChecks = 0;
+  const txtFail = [];
+  try {
+    MAKE_CANVAS = function (w, h) { return { width: w, height: h, getContext: function () { return rec; } }; };
+    STATIC = null; DIGC = null; PNTC = null; setViewport(3840, 2160);
+    const line = function (y0, x0, x1) {
+      const it = TX.filter(function (q) { return Math.abs(q[2] - y0) < 0.01 && q[1] >= x0 && q[1] < x1; });
+      it.sort(function (a, b) { return a[1] - b[1]; });
+      return it.map(function (q) { return q[0]; }).join('');
+    };
+    const bad = function (what, got) { txtBad++; if (txtFail.length < 6) txtFail.push(what + ' → "' + got + '"'); };
+    const sq = function (y0, x0, x1) { return line(y0, x0, x1).replace(/\s/g, ''); };   // a line without any spacing
+    const runs = function (y0, x0, x1) { return TX.filter(function (q) { return Math.abs(q[2] - y0) < 0.01 && q[1] >= x0 && q[1] < x1; }); };
+    const half = function (d) { return 0.5 * Math.pow(10, -d) + 1e-9; };                     // rounding tolerance, d decimals
+    const sigd = function (v, k) { return v > 0 ? Math.min(6, Math.max(0, k - 1 - Math.floor(Math.log10(v)))) : k - 1; };
+    const shownNum = function (str, y0, x0, x1, fs) {                // a number drawn as m.mmm or m.mmm×10^−e (exponent raised)
+      if (str.slice(-3) !== '×10') return parseFloat(str);
+      const ex = sq(y0 - 0.42 * fs, x0, x1); return parseFloat(str.slice(0, -3)) * Math.pow(10, -parseFloat(ex.replace('−', '')));
+    };
+    const ts = new Sim(NET_SEED0); ts.noSolve = true;
+    const ck = new Net();
+    let trS = -1, trT = 0;
+    const RA = [['x∈[0,1]', 'h=ReLU(Wx+b)', 'h=ReLU(Wh+b)', 'P=softmax(Wh+b)'],      // forward
+                ['∂L/∂x=Wδ', 'δ=Wδ⊙[z>0]', 'δ=Wδ⊙[z>0]', 'δ=P−y'],                // backward
+                ['v←μv−η∂L/∂W', 'W←W+v', 'W←W+v', 'W←W+v']];                       // update
+    const SIZES = ['16de784dibujadas', 'W:16×784b:16', 'W:16×16b:16', 'W:10×16b:10'];
+    const AUD = [[ST_IDLE, 5], [ST_IDLE, 22], [ST_INPUT, 5], [ST_INPUT, 15], [ST_FORWARD, 10], [ST_FORWARD, 30], [ST_FORWARD, 50],
+                 [ST_FORWARD, 70], [ST_FORWARD, 90], [ST_FORWARD, 108], [ST_SOFTMAX, 5], [ST_SOFTMAX, 25], [ST_LOSS, 5], [ST_LOSS, 20],
+                 [ST_BACKWARD, 5], [ST_BACKWARD, 15], [ST_BACKWARD, 40], [ST_BACKWARD, 60], [ST_BACKWARD, 80], [ST_BACKWARD, 100],
+                 [ST_UPDATE, 10], [ST_UPDATE, 40], [ST_TRAIN, 10], [ST_TRAIN, 40], [ST_TRAIN, 64]];
+    // the formula row, slot q: expected text, and lit (accent color) or dim
+    const rowA = function (q, fam, lit, ctx) {
+      const r = runs(ROW_A, SLOT_X[q] - 20, SLOT_X[q] + 20), txt = sq(ROW_A, SLOT_X[q] - 20, SLOT_X[q] + 20);
+      const want = fam === 3 ? RA[0][q] : fam === 4 ? RA[2][q] : RA[fam][q];
+      if (txt !== want) bad(ctx + ' formula ' + q, txt);
+      const acc = PAL_HEX[fam === 0 ? 7 : fam === 1 ? 13 : 8];
+      let hasAcc = false, allDim = true, allStat = true;
+      for (let i = 0; i < r.length; i++) { if (r[i][3] === acc) hasAcc = true; if (r[i][3] !== PAL_HEX[20]) allDim = false; if (r[i][3] !== PAL_HEX[19] && r[i][3] !== PAL_HEX[20]) allStat = false; }
+      if (fam >= 3 ? !allStat : lit ? !hasAcc : !allDim) bad(ctx + ' formula ' + q + (lit ? ' should be lit' : ' should be dim'), txt);
+      rowChecks++;
+    };
+    const lay = function (T, L) { let m = 0; for (let k = LOFF[L]; k < LOFF[L] + LN[L]; k++) if (T[k] > m) m = T[k]; return m; };
+    for (let f = 0; f < CYCLE_FRAMES * 12; f++) {
+      ts.step();
+      if (ts.state === ST_TRAIN && ts.t === 0) { trS = ts.net.steps; trT = ts.pending; }
+      let hit = false; for (let q = 0; q < AUD.length; q++) if (ts.state === AUD[q][0] && ts.t === AUD[q][1]) hit = true;
+      // plus the frames right before and at every moment a formula or a value is due to appear
+      for (let L = 0; L < 4; L++) {
+        if (ts.state === ST_FORWARD && L > 0) { const e = lay(ts.nFwdT, L); if (ts.t === e - 1 || ts.t === e) hit = true; }
+        if (ts.state === ST_BACKWARD) { const e = lay(ts.nBwdT, L); if (ts.t === e - 1 || ts.t === e) hit = true; }
+      }
+      if (ts.state === ST_BACKWARD && (ts.t === ts.paintT0 - 1 || ts.t === ts.paintT0)) hit = true;
+      if (!hit) continue;
+      TX.length = 0; render(rec, ts, 0); txtFrames++;
+      const st = ts.state, t = ts.t, n = ts.net, ctx = NAMES[st] + ' t=' + t;
+      const top = line(6, 0, LW); if (top !== PHASE_NUM[st] + NAMES[st] + CAPS[st]) bad('phase line', top);
+      for (let k = 0; k < 10; k++) { const lb = line(NY[48 + k] + 4.6, LABEL_X - 0.5, LABEL_X + 3); if (lb !== String(k)) bad('output label ' + k, lb); }
+      // status row: PASO / ÉPOCA / LOTE, which must satisfy PASO = (ÉPOCA − 1)·93 + LOTE
+      const sr = sq(ROW_C, 0, CARD_X), sm = /^PASO(\d+)·ÉPOCA(\d+)·LOTE(\d+)\/93·LOTESDE32·η=0\.0004·μ=0\.9·13002PARÁMETROS$/.exec(sr);
+      if (!sm || +sm[1] !== n.steps || +sm[2] !== n.epoch || +sm[3] !== Math.round(n.ptr / BATCH) || +sm[1] !== (+sm[2] - 1) * BPE + +sm[3]) bad('status row', sr);
+      // learning card
+      const c1 = /^PÉRDIDA([\d.]+)$/.exec(sq(109.9, CARD_X, LW));
+      if (!c1 || Math.abs(parseFloat(c1[1]) - ts.valLoss) > half(2)) bad('card: validation loss', sq(109.9, CARD_X, LW));
+      const c2 = /^VALID\.ENTREN\.EMA([\d.]+)$/.exec(sq(124.0, CARD_X, LW));
+      if (!c2 || Math.abs(parseFloat(c2[1]) - n.trainLoss) > half(2)) bad('card: training loss', sq(124.0, CARD_X, LW));
+      const c3 = /^ACIERTO([\d.]+)%$/.exec(sq(127.7, CARD_X, LW));
+      if (!c3 || Math.abs(parseFloat(c3[1]) - ts.valAcc * 100) > half(1)) bad('card: validation accuracy', sq(127.7, CARD_X, LW));
+      const c4 = /^(\d+)de500·VALIDACIÓN$/.exec(sq(142.5, CARD_X, LW));
+      if (!c4 || +c4[1] !== Math.round(ts.valAcc * NVAL)) bad('card: correct validation digits', sq(142.5, CARD_X, LW));
+      if (sq(LCH_Y + 0.8, CARD_X, LW) !== '2.5' || sq(ACH_Y + 0.8, CARD_X, LW) !== '100') bad('card: chart scales', sq(LCH_Y + 0.8, CARD_X, LW));
+      // independent recomputation of the highlighted digit with the current weights (unchanged from INPUT to UPDATE)
+      ck.W1.set(n.W1); ck.b1.set(n.b1); ck.W2.set(n.W2); ck.b2.set(n.b2); ck.W3.set(n.W3); ck.b3.set(n.b3);
+      const off = ts.vSample * N0, y = ts.vLabel;
+      ck.forward(trainX, off); ck.deltas(y);
+      let ink = 0, a1 = 0, a2 = 0, e1 = 0, e2 = 0, am = 0, gxm = 0;
+      for (let i = 0; i < N0; i++) if (trainX[off + i] > 0) ink++;
+      for (let i = 0; i < 16; i++) { if (ck.a1[i] > 0) a1++; if (ck.a2[i] > 0) a2++; if (ck.d1[i] !== 0) e1++; if (ck.d2[i] !== 0) e2++; }
+      for (let k = 1; k < 10; k++) if (ck.p[k] > ck.p[am]) am = k;
+      for (let i = 0; i < N0; i++) { let g = 0; for (let j = 0; j < N1; j++) g += ck.W1[i * N1 + j] * ck.d1[j]; const v = Math.abs(trainX[off + i] * g); if (v > gxm) gxm = v; }
+      // formula row + value row, lit exactly when the layer has been computed for this digit
+      let fam = 0; const lit = [false, false, false, false], litB = [false, false, false, false];
+      if (st === ST_IDLE) fam = trS >= 0 ? 4 : 3;
+      else if (st === ST_INPUT) { lit[0] = litB[0] = t >= 12; }
+      else if (st === ST_FORWARD) { lit[0] = litB[0] = true; for (let L = 1; L < 4; L++) { lit[L] = t >= lay(ts.nFwdT, L); litB[L] = L < 3 && lit[L]; } }
+      else if (st === ST_SOFTMAX) { for (let L = 0; L < 4; L++) { lit[L] = true; litB[L] = L < 3 || t >= 10; } }
+      else if (st === ST_LOSS) { for (let L = 0; L < 4; L++) lit[L] = litB[L] = true; }
+      else if (st === ST_BACKWARD) { fam = 1; for (let L = 0; L < 4; L++) { lit[L] = t >= lay(ts.nBwdT, L); litB[L] = lit[L] && (L > 0 || t >= ts.paintT0); } }
+      else if (st === ST_UPDATE) { fam = 2; for (let L = 0; L < 4; L++) lit[L] = litB[L] = true; }
+      else if (st === ST_TRAIN) fam = 4;
+      for (let q = 0; q < 4; q++) {
+        rowA(q, fam, lit[q], ctx);
+        const rb = sq(ROW_B, SLOT_X[q] - 20, SLOT_X[q] + 20);
+        if (fam === 3) { if (rb !== SIZES[q]) bad(ctx + ' sizes ' + q, rb); continue; }
+        if (fam === 4) {
+          if (q > 0) { if (rb !== SIZES[q]) bad(ctx + ' sizes ' + q, rb); continue; }
+          const m = /^(\d+)de(\d+)pasos$/.exec(rb);
+          if (!m || +m[1] !== n.steps - trS || +m[2] !== trT) bad(ctx + ' training progress', rb);
+          continue;
+        }
+        if (!litB[q]) { if (rb !== '') bad(ctx + ' value ' + q + ' shown before it is computed', rb); continue; }
+        let ok = true;
+        if (fam === 0) {
+          if (q === 0) { const m = /^(\d+)pxcontinta$/.exec(rb); ok = !!m && +m[1] === ink; }
+          else if (q < 3) { const m = /^(\d+)de16activas$/.exec(rb); ok = !!m && +m[1] === (q === 1 ? a1 : a2); }
+          else { const m = /^máxP\((\d)\)=([\d.]+)$/.exec(rb); ok = !!m && +m[1] === am && Math.abs(parseFloat(m[2]) - ck.p[am]) <= half(3); }
+        } else if (fam === 1) {
+          if (q === 0) { const m = /^máx\|x·∂L\/∂x\|=([\d.]+(?:×10)?)$/.exec(rb); ok = !!m && Math.abs(shownNum(m[1], ROW_B, SLOT_X[0] - 20, SLOT_X[0] + 20, FSB.sz) - gxm) <= (gxm >= 1e-3 ? half(sigd(gxm, 3)) : 5e-3 * gxm); }
+          else if (q < 3) { const m = /^(\d+)de16≠0$/.exec(rb); ok = !!m && +m[1] === (q === 1 ? e1 : e2); }
+          else { const m = /^δ\((\d)\)=(−?)([\d.]+)$/.exec(rb); ok = !!m && +m[1] === y && Math.abs((m[2] ? -1 : 1) * parseFloat(m[3]) - (ck.p[y] - 1)) <= half(4); }
+        } else {
+          if (q === 0) ok = rb === 'η=' + LR + ',μ=' + MOM;
+          else { const m = /^‖ΔW‖=([\d.]+(?:×10)?)$/.exec(rb), v = Math.sqrt(sumsq(q === 1 ? n.vW1 : q === 2 ? n.vW2 : n.vW3));
+                 ok = !!m && Math.abs(shownNum(m[1], ROW_B, SLOT_X[q] - 20, SLOT_X[q] + 20, FSB.sz) - v) <= (v >= 1e-3 ? half(sigd(v, 3)) : 5e-3 * v); }
+        }
+        if (!ok) bad(ctx + ' value ' + q, rb);
+      }
+      // right column: P(ŷ), the true label with ACIERTO / ERROR, and L worked out from P(y)
+      const win = (st === ST_SOFTMAX && t >= 10) || st === ST_LOSS || st === ST_BACKWARD || st === ST_UPDATE || st === ST_TRAIN;
+      const pl = sq(PRED_Y + PRED_H + 7.5, PRED_X - 1, LW), pm = /^P\((\d)\)=([\d.]+)$/.exec(pl);
+      if (win ? (!pm || +pm[1] !== ts.vPred || Math.abs(parseFloat(pm[2]) - ts.vp[ts.vPred]) > half(3)) : pl !== '') bad('P(ŷ)', pl);
+      const truth = st === ST_LOSS || st === ST_BACKWARD || st === ST_UPDATE || st === ST_TRAIN;
+      const yl = sq(PRED_Y + PRED_H + 14.5, PRED_X - 1, LW), ym = /^y=(\d)(ACIERTO|ERROR)$/.exec(yl);
+      if (truth ? (!ym || +ym[1] !== y || (ym[2] === 'ACIERTO') !== (ts.vPred === y)) : yl !== '') bad('y', yl);
+      const showL = truth && (st !== ST_LOSS || t >= TL_LOSS);
+      const l1 = sq(LOSS_Y + 10.6, LOSS_TX - 0.5, LW), l2 = sq(LOSS_Y + 16.4, LOSS_TX - 1.5, LW), l3 = sq(LOSS_Y + 22.2, LOSS_TX - 0.5, LW);
+      if (showL) {
+        const py = ts.vp[y], dl = ts.vLoss >= 10 ? 2 : 3;
+        if (l1 !== 'L=−lnP(' + y + ')') bad('L = −ln P(y)', l1);
+        const m2 = /^=−ln([\d.]+(?:×10)?)$/.exec(l2), m3 = /^=([\d.]+)$/.exec(l3);
+        const shownP = m2 ? shownNum(m2[1], LOSS_Y + 16.4, LOSS_TX - 1.5, LW, FSR.sz) : NaN;
+        if (!m2 || Math.abs(shownP - py) > (py >= 1e-3 ? half(sigd(py, 4)) : 5e-4 * py)) bad('= −ln P(y)', l2);
+        if (!m3 || Math.abs(parseFloat(m3[1]) - ts.vLoss) > half(dl)) bad('= L', l3);
+        else if (m2 && Math.abs(-Math.log(shownP) - parseFloat(m3[1])) > half(dl) + 0.0006) bad('−ln(shown P(y)) ≠ shown L', l2 + ' / ' + l3);
+        if (py > 1e-30 && Math.abs(ts.vLoss + Math.log(py)) > 1e-6) bad('L ≠ −ln P(y)', l3);
+        if (!ts.vCorrect) txtWrong++;
+      } else if (l1 !== '' || l2 !== '' || l3 !== '') bad('loss text visible too early', l1 + '|' + l2 + '|' + l3);
+    }
+    // SOLVED: the card shows the test accuracy of the final model (the one evaluation of the test set) and the rows the model
+    if (solvedOk) {
+      while (sv.state === ST_SOLVED && sv.t < 130) sv.step();
+      TX.length = 0; render(rec, sv, 0); txtFrames++;
+      const top = line(6, 0, LW); if (top !== NAMES[ST_SOLVED] + CAPS[ST_SOLVED]) bad('phase line at SOLVED', top);
+      const c3 = /^ACIERTO([\d.]+)%$/.exec(sq(127.7, CARD_X, LW)), c4 = /^(\d+)de500·TEST,1VEZ$/.exec(sq(142.5, CARD_X, LW));
+      if (!c3 || Math.abs(parseFloat(c3[1]) - sv.finalTestAcc * 100) > half(1)) bad('card at SOLVED', sq(127.7, CARD_X, LW));
+      if (!c4 || +c4[1] !== Math.round(sv.finalTestAcc * NTEST)) bad('test count at SOLVED', sq(142.5, CARD_X, LW));
+      for (let q = 0; q < 4; q++) { rowA(q, 3, false, 'SOLVED'); if (sq(ROW_B, SLOT_X[q] - 20, SLOT_X[q] + 20) !== SIZES[q]) bad('SOLVED sizes ' + q, sq(ROW_B, SLOT_X[q] - 20, SLOT_X[q] + 20)); }
+    } else bad('SOLVED never reached', '');
+  } finally {
+    MAKE_CANVAS = RS[0]; STATIC = RS[1]; SPR = RS[3]; DIGC = RS[4]; DIGX = RS[5]; DIGI = RS[6]; PNTC = RS[7]; PNTX = RS[8]; PNTI = RS[9];
+    VW = RS[10]; VH = RS[11]; K = RS[12]; OX = RS[13]; OY = RS[14]; ADV = RS[15]; LEDG = RS[16]; STATIC_KEY = -1;
+    if (MAKE_CANVAS) setViewport(VW, VH);   // re-measure glyph widths (the recording context measured them its own way)
+  }
+  check(txtFrames >= 250 && rowChecks >= 1000 && txtBad === 0, 'text drawn on screen equals the values (' + txtFrames + ' frames, ' + rowChecks + ' formula slots, ' + txtWrong + ' with a wrong prediction, ' + txtBad + ' mismatches' + (txtFail.length ? ': ' + txtFail.join('; ') : '') + ')');
+
+  // 12) the painted map x·∂L/∂x (gradient × input) vs Integrated Gradients from a black image (Sundararajan et al. 2017,
+  //     64 midpoint steps). IG satisfies completeness, Σ IG = L(x) − L(black); gradient × input is the first-order
+  //     (local) version, so it shares the pattern and signs but not the total
+  const igN = new Net();
+  igN.W1.set(ln.W1); igN.b1.set(ln.b1); igN.W2.set(ln.W2); igN.b2.set(ln.b2); igN.W3.set(ln.W3); igN.b3.set(ln.b3);
+  const xb = new Float32Array(N0), gv = new Float64Array(N0), igv = new Float64Array(N0), giv = new Float64Array(N0);
+  const lossGrad = function (y) {
+    igN.forward(xb, 0); const L = igN.nll(y); igN.deltas(y);
+    for (let i = 0; i < N0; i++) { let a = 0; for (let j = 0; j < N1; j++) a += igN.W1[i * N1 + j] * igN.d1[j]; gv[i] = a; }
+    return L;
+  };
+  const IGM = 64, igR = [], igS = [], igF = []; let igWorst = 0;
+  for (let t = 0; t < 20; t++) {
+    const q = 37 * t + 5, y = trainY[q], off = q * N0;
+    for (let i = 0; i < N0; i++) xb[i] = trainX[off + i];
+    const L1 = lossGrad(y); for (let i = 0; i < N0; i++) giv[i] = xb[i] * gv[i];
+    xb.fill(0); const L0 = lossGrad(y);
+    igv.fill(0);
+    for (let m = 0; m < IGM; m++) {
+      const a = (m + 0.5) / IGM; for (let i = 0; i < N0; i++) xb[i] = a * trainX[off + i];
+      lossGrad(y); for (let i = 0; i < N0; i++) igv[i] += gv[i] / IGM;
+    }
+    let sIG = 0, sGI = 0, mx = 0, my = 0, n = 0;
+    for (let i = 0; i < N0; i++) { igv[i] *= trainX[off + i]; sIG += igv[i]; sGI += giv[i]; if (trainX[off + i] > 0) { mx += giv[i]; my += igv[i]; n++; } }
+    const dL = L1 - L0; igWorst = Math.max(igWorst, Math.abs(sIG - dL) / Math.max(0.05, Math.abs(dL)));
+    mx /= n; my /= n; let sxy = 0, sxx = 0, syy = 0, ag = 0, tot = 0;
+    for (let i = 0; i < N0; i++) if (trainX[off + i] > 0) {
+      sxy += (giv[i] - mx) * (igv[i] - my); sxx += (giv[i] - mx) * (giv[i] - mx); syy += (igv[i] - my) * (igv[i] - my);
+      tot += Math.abs(igv[i]); if ((igv[i] > 0) === (giv[i] > 0)) ag += Math.abs(igv[i]);
+    }
+    igR.push(sxy / Math.sqrt(sxx * syy)); igS.push(ag / tot); igF.push(sGI / dL);
+  }
+  const med = function (a) { const b = a.slice().sort(function (p, r) { return p - r; }); return b[b.length >> 1]; };
+  check(igWorst < 0.01, 'Integrated Gradients completeness: Σ IG = L(x) − L(black) within 1% on 20 digits (worst ' + (igWorst * 100).toFixed(2) + '%)');
+  check(med(igR) > 0.8 && med(igS) > 0.9, 'painted x·∂L/∂x agrees with Integrated Gradients (median r = ' + med(igR).toFixed(2) +
+    ', |IG|-weighted sign agreement ' + (med(igS) * 100).toFixed(0) + '%)');
+
+  // Wilson 95% interval for the test accuracy, per-class accuracy
+  const z = 1.96, ph = ln.lastAcc, nn = NTEST, den = 1 + z * z / nn;
+  const ctr = (ph + z * z / (2 * nn)) / den, hw = z * Math.sqrt(ph * (1 - ph) / nn + z * z / (4 * nn * nn)) / den;
+  let perClass = '';
+  for (let y = 0; y < 10; y++) { let tot = 0; for (let q = 0; q < 10; q++) tot += conf[y * 10 + q]; perClass += y + ':' + Math.round(100 * conf[y * 11] / tot) + '% '; }
+
+  console.log('[selfTest] ' + (pass ? 'PASS' : 'FAIL') + ' in ' + Math.round(nowMs() - T0) + ' ms');
+  const perCycle = 1 + TRAIN_STEPS_PER_FRAME * DUR[ST_TRAIN];
+  console.log('[selfTest] steps to 93%: ' + stepsTo + ' (~' + (stepsTo / perCycle).toFixed(1) + ' cycles, ~' +
+    Math.round(stepsTo / perCycle * CYCLE_FRAMES / 60) + ' s of animation), test accuracy ' + (ln.lastAcc * 100).toFixed(1) + '%');
+  console.log('[selfTest] holdout: SOLVED on validation ' + (valAtSolve * 100).toFixed(1) + '% at step ' + sv.net.steps + ' (~' +
+    Math.round(svFrames / 60) + ' s), then the test set once: ' + (testAtSolve * 100).toFixed(1) + '% (test reads before SOLVED: ' + testReads + ')');
+  console.log('[selfTest] attribution: Integrated Gradients completeness worst ' + (igWorst * 100).toFixed(2) + '%; painted x·∂L/∂x vs IG: median r ' +
+    med(igR).toFixed(2) + ', sign agreement ' + (med(igS) * 100).toFixed(0) + '%, Σ x·∂L/∂x = ' + (med(igF) * 100).toFixed(0) + '% of L(x) − L(black) (first-order only)');
+  console.log('[selfTest] gradient check: ' + gcount + ' params, worst rel err ' + gworst.toExponential(2) +
+    '; particles: peak ' + loopMax + ' during 3 cycles, ' + sim.alive + '/' + PCAP + ' under a 3x over-spawn stress');
+  console.log('[selfTest] test accuracy 95% CI (Wilson, n=500): ' + ((ctr - hw) * 100).toFixed(1) + '% – ' + ((ctr + hw) * 100).toFixed(1) + '%');
+  console.log('[selfTest] per-class accuracy: ' + perClass);
+  console.log('[selfTest] sync: ' + NE + ' edges × 6 cycles, 0 violations allowed → ' + syncBad + '; SGD mismatches ' + sgdBad + '; test/train duplicates ' + dup);
+  console.log('[selfTest] display audit: ' + nCyc + ' cycles re-derived independently (incl. ∂L/∂x and the painted x·∂L/∂x for all 784 pixels), mesh checked on ' + meshChecks + ' frames, ' + nEval + ' validation evaluations re-run → ' + (dispBad + lvlBad + gradBad + meshBad + hudBad + epochBad) + ' mismatches');
+  console.log('[selfTest] on-screen text audit: ' + txtFrames + ' rendered frames re-read, ' + rowChecks + ' formula slots checked lit/dim (' + txtWrong + ' with a wrong prediction) → ' + txtBad + ' mismatches; 7-segment table ' + (ledBad ? 'WRONG' : 'ok'));
+  console.log('[selfTest] drawn input pixels (row,col): ' + Array.from(SAMPLE_PIX).map(function (q) { return '(' + ((q / 28) | 0) + ',' + (q % 28) + ')'; }).join(' '));
+  console.log('[selfTest] confusion matrix (500 test digits):\n' + rows);
+  return { pass: pass, stepsTo93: stepsTo, testAcc: ln.lastAcc, ci95: [ctr - hw, ctr + hw], gradWorst: gworst, syncViolations: syncBad, confusion: conf,
+    valAtSolve: valAtSolve, stepsAtSolve: sv.net.steps, finalTestAcc: testAtSolve, igMedianR: med(igR), igSignAgree: med(igS), igCompletenessWorst: igWorst };
+}
+
+// ---------------------------------------------------------------- procedural audio (WebAudio, no assets)
+// A fixed pool of always-running voices; notes are envelopes on their gains, so playing allocates no nodes.
+// Every sound is driven by a simulation event and scaled by the real quantity behind it.
+const SND = { ctx: null, on: false, master: null, sq: [], sqg: [], tr: [], trg: [], si: 0, ti: 0,
+  nf: null, ng: null, sub: null, subg: null, dr: null, drg: null, read: 0, tick: 0 };
+const PENT = [0, 3, 5, 7, 10, 12, 15, 17, 19, 22];
+const IGN_F = [220, 330, 440, 660], IGN_B = [110, 147, 196, 262];
+const PHASE_HZ = [262, 294, 330, 392, 440, 494, 523, 587, 659];
+function semis(base, k) { return base * Math.pow(2, PENT[k % 10] / 12); }
+function layerOf(n) { return n < 16 ? 0 : n < 32 ? 1 : n < 48 ? 2 : 3; }
+function sndInit(sim) {
+  if (SND.ctx) return;
+  const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return;
+  const c = SND.ctx = new AC();
+  const comp = c.createDynamicsCompressor(); comp.connect(c.destination);
+  const m = SND.master = c.createGain(); m.gain.value = 0; m.connect(comp);
+  const voice = function (type, oscArr, gainArr) {
+    const o = c.createOscillator(), g = c.createGain(); o.type = type; g.gain.value = 0;
+    o.connect(g); g.connect(m); o.start(); oscArr.push(o); gainArr.push(g);
+  };
+  for (let i = 0; i < 8; i++) voice('square', SND.sq, SND.sqg);
+  for (let i = 0; i < 8; i++) voice('triangle', SND.tr, SND.trg);
+  const sub = [], subg = [], dr = [], drg = [];
+  voice('sine', sub, subg); voice('triangle', dr, drg);
+  SND.sub = sub[0]; SND.subg = subg[0]; SND.dr = dr[0]; SND.drg = drg[0];
+  const buf = c.createBuffer(1, c.sampleRate, c.sampleRate), d = buf.getChannelData(0), r = new Rng(99);
+  for (let i = 0; i < d.length; i++) d[i] = r.next() * 2 - 1;
+  const ns = c.createBufferSource(); ns.buffer = buf; ns.loop = true;
+  SND.nf = c.createBiquadFilter(); SND.nf.type = 'bandpass';
+  SND.ng = c.createGain(); SND.ng.gain.value = 0;
+  ns.connect(SND.nf); SND.nf.connect(SND.ng); SND.ng.connect(m); ns.start();
+  SND.read = sim.evHead;
+}
+function env(g, t, vol, dur) {
+  const p = g.gain; p.cancelScheduledValues(t); p.setValueAtTime(0.0001, t);
+  p.linearRampToValueAtTime(vol, t + 0.005); p.exponentialRampToValueAtTime(0.0001, t + dur);
+}
+function sq(f, vol, dur, delay, f2) {
+  const t = SND.ctx.currentTime + delay, i = SND.si; SND.si = (i + 1) % SND.sq.length;
+  const fr = SND.sq[i].frequency; fr.cancelScheduledValues(t); fr.setValueAtTime(f, t);
+  if (f2 > 0) fr.exponentialRampToValueAtTime(f2, t + dur);
+  env(SND.sqg[i], t, vol, dur);
+}
+function tri(f, vol, dur, delay) {
+  const t = SND.ctx.currentTime + delay, i = SND.ti; SND.ti = (i + 1) % SND.tr.length;
+  const fr = SND.tr[i].frequency; fr.cancelScheduledValues(t); fr.setValueAtTime(f, t);
+  env(SND.trg[i], t, vol, dur);
+}
+function nz(fc, q, vol, dur, fc2) {
+  const t = SND.ctx.currentTime, fr = SND.nf.frequency;
+  fr.cancelScheduledValues(t); fr.setValueAtTime(fc, t); if (fc2 > 0) fr.exponentialRampToValueAtTime(fc2, t + dur);
+  SND.nf.Q.setValueAtTime(q, t); env(SND.ng, t, vol, dur);
+}
+function thump(f, f2, vol, dur) {
+  const t = SND.ctx.currentTime, fr = SND.sub.frequency;
+  fr.cancelScheduledValues(t); fr.setValueAtTime(f, t); fr.exponentialRampToValueAtTime(f2, t + dur);
+  env(SND.subg, t, vol, dur);
+}
+function sndUpdate(sim, paused) {
+  if (!SND.ctx) return;
+  if (sim.evHead - SND.read > 256) SND.read = sim.evHead - 256;
+  let budget = 3;                                   // at most 3 neuron blips per frame
+  for (; SND.read < sim.evHead; SND.read++) {
+    if (!SND.on) continue;
+    const i = SND.read & 255, a = sim.evA[i], v = sim.evV[i];
+    switch (sim.evT[i]) {
+      case EV_STATE:                                // a soft marker note per phase (rising through the cycle)
+        tri(PHASE_HZ[a], 0.035, 0.1, 0);
+        if (a === ST_SOLVED) for (let j = 0; j < 6; j++) tri(semis(523, j), 0.08, 0.2, j * 0.07);
+        break;
+      case EV_WRITE: nz(2200 + v * 900, 2.5, 0.05, 0.04, 1500); break;              // pen scratch
+      case EV_LAUNCH: nz(600, 1.4, 0.07, 0.16, 5200); break;                       // pixels fly
+      case EV_ARRIVE: if (a > 0) tri(semis(220, a), 0.06, 0.14, 0); break;         // pitch = lit input neurons
+      case EV_IGNF:                                                                 // pitch = layer + neuron, loudness = level
+        if (budget > 0) { budget--; const L = layerOf(a); sq(semis(IGN_F[L], a - LOFF[L]), 0.018 + 0.016 * v, 0.07, 0, 0); }
+        break;
+      case EV_IGNB:
+        if (budget > 0) { budget--; const L = layerOf(a), f = semis(IGN_B[L], a - LOFF[L]); sq(f, 0.022 + 0.016 * v, 0.11, 0, f * 0.7); }
+        break;
+      case EV_PRED: {                                // major arpeggio if right, minor-second clash if wrong
+        const r = 330 * Math.pow(2, a / 12);
+        if (v > 0.5) { tri(r, 0.12, 0.25, 0); tri(r * 1.2599, 0.1, 0.25, 0.06); tri(r * 1.4983, 0.1, 0.35, 0.12); }
+        else { sq(r, 0.04, 0.3, 0, 0); sq(r * 1.0595, 0.04, 0.3, 0, 0); }
+        break;
+      }
+      case EV_GLITCH: nz(4200, 0.7, 0.12, 0.06, 1400); sq(90, 0.05, 0.06, 0, 60); break;
+      case EV_LOSS: {                                // loudness and brightness ∝ cross-entropy of this sample
+        const k = 1 - Math.exp(-v);   // = 1 − p_y
+        thump(150, 45, 0.12 + 0.38 * k, 0.28); nz(300 + 2600 * k, 0.8, 0.03 + 0.17 * k, 0.15 + 0.25 * k, 200);
+        break;
+      }
+      case EV_UPDATE: {                              // shimmer ∝ ||Δθ|| relative to its recent average
+        const k = Math.min(1.5, v) / 1.5;
+        for (let j = 0; j < 4; j++) tri(semis(1047, j + 2), 0.025 + 0.05 * k, 0.12, j * 0.03);
+        nz(7000, 1, 0.015 + 0.04 * k, 0.2, 9000);
+        break;
+      }
+      case EV_TICK:                                  // fast-forward ticks; pitch rises as training loss falls
+        if ((SND.tick++ % 3) === 0) sq(180 + (1 - Math.min(v, 2.3) / 2.3) * 520, 0.016, 0.025, 0, 0);
+        break;
+      case EV_EVAL: tri(300 + v * 900, 0.06, 0.13, 0); break;                     // pitch ∝ validation accuracy
+      case EV_SCAN: tri(110 * Math.pow(2, (a - 50) / 71), 0.045, 0.07, 0); break;
+      case EV_PARADE: tri(semis(392, a), 0.08, 0.16, 0); break;
+      case EV_RESET: thump(90, 35, 0.22, 0.6); break;
+      case EV_WIRE: sq(semis(110, a), 0.02 + 0.012 * v, 0.06, 0, 0); break;                     // ∂L/∂x_i reaches its pixel
+      case EV_PAINT: nz(900 + 2600 * (1 - v), 1.3, 0.04 + 0.01 * a, 0.09, 500); break;          // brush stroke
+    }
+  }
+  // drone follows the active wave front: rises left→right in FORWARD, falls right→left in BACKWARD
+  const now = SND.ctx.currentTime, xf = SND.on && !paused ? sim.frontX() : -1000;
+  if (xf > -1000) { SND.dr.frequency.setTargetAtTime(110 * Math.pow(2, (xf - 54) / 132), now, 0.03); SND.drg.gain.setTargetAtTime(0.05, now, 0.05); }
+  else SND.drg.gain.setTargetAtTime(0, now, 0.06);
+}
+
+// ---------------------------------------------------------------- boot (browser only)
+// Controls: tap/click once = sound on. Then: tap = pause, speaker (top-left) = mute, speed (top-right) = 1×/½×/¼×.
+// Keys: Space pause · M mute · S speed · → advance 5 frames while paused · F fullscreen · P save a 3840×2160 PNG.
+function boot() {
+  const cv = document.getElementById('screen');
+  const ctx = cv.getContext('2d', { alpha: false });
+  MAKE_CANVAS = function (w, h) { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; };
+  const sim = new Sim(NET_SEED0); sim.budgetMs = 5;
+  window.sim = sim;
+  let accT = 0, last = -1, lastDpr = 0;
+  function resize() {
+    let dpr = window.devicePixelRatio || 1;
+    const cap = Math.sqrt((7680 * 4320) / Math.max(1, window.innerWidth * window.innerHeight * dpr * dpr));
+    lastDpr = window.devicePixelRatio || 1; if (cap < 1) dpr *= cap;            // never above 8K worth of pixels
+    const w = Math.round(window.innerWidth * dpr), h = Math.round(window.innerHeight * dpr);
+    cv.width = w; cv.height = h; cv.style.width = window.innerWidth + 'px'; cv.style.height = window.innerHeight + 'px';
+    setViewport(w, h);
+  }
+  function soundOn(v) {
+    sndInit(sim); if (!SND.ctx) { UI_SOUND = 2; return; }        // no WebAudio: stay silent, taps keep working
+    if (SND.ctx.state === 'suspended') SND.ctx.resume();
+    SND.on = v; UI_SOUND = v ? 1 : 2;
+    SND.master.gain.setTargetAtTime(v ? 0.5 : 0, SND.ctx.currentTime, 0.02);
+  }
+  function shot4k() {   // render the current frame at 3840×2160 regardless of the window size
+    const w0 = VW, h0 = VH, c4 = MAKE_CANVAS(3840, 2160);
+    setViewport(3840, 2160); render(c4.getContext('2d', { alpha: false }), sim, 0); setViewport(w0, h0);
+    c4.toBlob(function (b) {
+      const a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = 'red-neuronal-4k.png';
+      document.body.appendChild(a); a.click(); a.remove(); setTimeout(function () { URL.revokeObjectURL(a.href); }, 3000);
+    }, 'image/png');
+  }
+  window.shot4k = shot4k;
+  cv.addEventListener('pointerdown', function (e) {
+    e.preventDefault();
+    if (UI_SOUND === 0) { soundOn(true); return; }
+    const r = cv.getBoundingClientRect(), k = cv.width / r.width;
+    const lx = ((e.clientX - r.left) * k - OX) / K, ly = ((e.clientY - r.top) * k - OY) / K;
+    if (ly < 10 && lx < 40) soundOn(UI_SOUND !== 1);
+    else if (ly < 10 && lx > 216) UI_SPEED = (UI_SPEED + 1) % SPEEDS.length;
+    else UI_PAUSED = !UI_PAUSED;
+  });
+  window.addEventListener('keydown', function (e) {
+    if (UI_SOUND === 0) { soundOn(true); if (e.code === 'KeyM') return; }
+    if (e.code === 'Space') { UI_PAUSED = !UI_PAUSED; e.preventDefault(); }
+    else if (e.code === 'KeyM') soundOn(UI_SOUND !== 1);
+    else if (e.code === 'KeyS') UI_SPEED = (UI_SPEED + 1) % SPEEDS.length;
+    else if (e.code === 'ArrowRight' && UI_PAUSED) { for (let i = 0; i < 5; i++) sim.step(); }
+    else if (e.code === 'KeyP') shot4k();
+    else if (e.code === 'KeyF') {
+      if (!document.fullscreenElement) { if (document.documentElement.requestFullscreen) document.documentElement.requestFullscreen(); }
+      else if (document.exitFullscreen) document.exitFullscreen();
+    }
+  });
+  document.addEventListener('visibilitychange', function () {   // hidden tab: no frames → stop the drone too
+    if (!SND.ctx) return;
+    if (document.hidden) SND.ctx.suspend(); else if (SND.on) SND.ctx.resume();
+  });
+  window.addEventListener('resize', resize); resize();
+  function frame(now) {
+    if (last < 0) last = now;
+    let el = now - last; last = now; if (el > 250) el = 250;
+    UI_BLINK++;
+    if ((window.devicePixelRatio || 1) !== lastDpr) resize();    // moved to another monitor or zoomed
+    if (!UI_PAUSED) {
+      accT += el * SPEEDS[UI_SPEED];
+      let n = 0; while (accT >= DT && n < 8) { sim.step(); accT -= DT; n++; }
+      if (n === 8) accT = 0;
+    }
+    sndUpdate(sim, UI_PAUSED);
+    render(ctx, sim, UI_PAUSED ? 0 : accT / DT);
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+}
+if (typeof window !== 'undefined') window.selfTest = selfTest;
+if (typeof document !== 'undefined' && document.getElementById) {
+  if (/[?&]test\b/.test(location.search)) selfTest();
+  boot();
+}
+</script>
+</body>
+</html>
